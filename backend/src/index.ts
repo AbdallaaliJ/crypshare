@@ -44,8 +44,8 @@ app.get("/health", (req, res) => {
 });
 
 app.post("/register", (req, res) => {
-  const { username, salt, publicKey, encryptedPrivateKey, iv } = req.body;
-  if (!username || !salt || !publicKey || !encryptedPrivateKey || !iv) {
+  const { username, salt, identityPublicKeyECDH, identityPublicKeyECDSA, encryptedPrivateKeyECDH, ivECDH, encryptedPrivateKeyECDSA, ivECDSA } = req.body;
+  if (!username || !salt || !identityPublicKeyECDH || !identityPublicKeyECDSA || !encryptedPrivateKeyECDH || !ivECDH || !encryptedPrivateKeyECDSA || !ivECDSA) {
     res.status(400).json({ error: "Missing required fields" });
     return;
   }
@@ -53,9 +53,12 @@ app.post("/register", (req, res) => {
   // Store simply in memory
   database[username] = {
     salt,
-    publicKey,
-    encryptedPrivateKey,
-    iv,
+    identityPublicKeyECDH,
+    identityPublicKeyECDSA,
+    encryptedPrivateKeyECDH,
+    ivECDH,
+    encryptedPrivateKeyECDSA,
+    ivECDSA,
     preKeys: [],
     inbox: []
   };
@@ -112,20 +115,41 @@ app.get("/prekey/:username", (req, res) => {
   console.log(`Issued One-Time Pre-Key for ${username}. Remaining: ${remaining}`);
   
   // Return only the public part
-  res.json({ preKey: { publicKeyHex: preKey.publicKeyHex } });
+  res.json({ 
+    preKey: { publicKeyHex: preKey.publicKeyHex },
+    identityPublicKeyECDH: userRecord.identityPublicKeyECDH,
+    identityPublicKeyECDSA: userRecord.identityPublicKeyECDSA
+  });
 });
 
 app.get("/users", (req, res) => {
   const users = Object.keys(database).map(username => ({
     username,
-    publicKey: database[username].publicKey
+    identityPublicKeyECDH: database[username].identityPublicKeyECDH,
+    identityPublicKeyECDSA: database[username].identityPublicKeyECDSA
   }));
   res.json(users);
 });
 
+app.get("/identity/:username", (req, res) => {
+  const { username } = req.params;
+  const userRecord = database[username];
+  if (!userRecord) {
+    res.status(404).json({ error: "User not found" });
+    return;
+  }
+  res.json({
+    salt: userRecord.salt,
+    encryptedPrivateKeyECDH: userRecord.encryptedPrivateKeyECDH,
+    ivECDH: userRecord.ivECDH,
+    encryptedPrivateKeyECDSA: userRecord.encryptedPrivateKeyECDSA,
+    ivECDSA: userRecord.ivECDSA
+  });
+});
+
 app.post("/upload", uploadMiddleware.single("fileBlob"), (req, res) => {
-  const { recipientUsername, fileIv, wrappedFileKey, ephemeralPublicKey, usedPreKey, originalFilename } = req.body;
-  if (!recipientUsername || !req.file || !fileIv || !wrappedFileKey || !ephemeralPublicKey || !usedPreKey) {
+  const { recipientUsername, senderUsername, signature, fileIv, wrappedFileKey, ephemeralPublicKey, usedPreKey, originalFilename } = req.body;
+  if (!recipientUsername || !senderUsername || !signature || !req.file || !fileIv || !wrappedFileKey || !ephemeralPublicKey || !usedPreKey) {
     res.status(400).json({ error: "Missing file package components" });
     return;
   }
@@ -154,6 +178,8 @@ app.post("/upload", uploadMiddleware.single("fileBlob"), (req, res) => {
     wrappedFileKey,
     ephemeralPublicKey,
     usedPreKey,
+    senderUsername,
+    signature,
     encryptedPrivatePreKey: matchingPreKey ? matchingPreKey.encryptedPrivateKey : null,
     preKeyIv: matchingPreKey ? matchingPreKey.iv : null,
     timestamp: Date.now()

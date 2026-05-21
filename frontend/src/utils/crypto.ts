@@ -88,6 +88,72 @@ export async function exportPublicKey(publicKey: CryptoKey): Promise<string> {
   return bytesToHex(new Uint8Array(exported));
 }
 
+export async function generateSigningKeyPair(): Promise<CryptoKeyPair> {
+  return window.crypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-256" },
+    true,
+    ["sign", "verify"]
+  );
+}
+
+export async function signPayload(privateKey: CryptoKey, payload: string): Promise<string> {
+  const enc = new TextEncoder();
+  const signature = await window.crypto.subtle.sign(
+    { name: "ECDSA", hash: { name: "SHA-256" } },
+    privateKey,
+    enc.encode(payload)
+  );
+  return bytesToHex(new Uint8Array(signature));
+}
+
+export async function verifySignature(publicKey: CryptoKey, signatureHex: string, payload: string): Promise<boolean> {
+  const enc = new TextEncoder();
+  const signatureBytes = hexToBytes(signatureHex);
+  return window.crypto.subtle.verify(
+    { name: "ECDSA", hash: { name: "SHA-256" } },
+    publicKey,
+    signatureBytes as any,
+    enc.encode(payload)
+  );
+}
+
+export async function importECDSAPublicKey(hexKey: string): Promise<CryptoKey> {
+  const keyBytes = hexToBytes(hexKey);
+  return window.crypto.subtle.importKey(
+    "spki",
+    keyBytes as any,
+    { name: "ECDSA", namedCurve: "P-256" },
+    true,
+    ["verify"]
+  );
+}
+
+export async function deriveRawSecret(privateKey: CryptoKey, publicKey: CryptoKey): Promise<Uint8Array> {
+  const bits = await window.crypto.subtle.deriveBits(
+    { name: "ECDH", public: publicKey },
+    privateKey,
+    256
+  );
+  return new Uint8Array(bits);
+}
+
+export async function unwrapPrivateKey(
+  encryptedPrivateKeyHex: string,
+  ivHex: string,
+  kek: CryptoKey,
+  type: "ECDH" | "ECDSA" = "ECDH"
+): Promise<CryptoKey> {
+  return window.crypto.subtle.unwrapKey(
+    "pkcs8",
+    hexToBytes(encryptedPrivateKeyHex) as any,
+    kek,
+    { name: "AES-GCM", iv: hexToBytes(ivHex) as any },
+    { name: type, namedCurve: "P-256" },
+    false,
+    type === "ECDH" ? ["deriveBits"] : ["sign"]
+  );
+}
+
 // ==========================================
 // Phase 2: Hybrid Encryption (Secure Data)
 // ==========================================
@@ -143,23 +209,37 @@ export async function generatePreKeys(kek: CryptoKey, count: number): Promise<{ 
   return preKeys;
 }
 
-export async function encryptFileKeyWithPreKey(fileKey: CryptoKey, recipientPreKeyHex: string): Promise<{ wrappedFileKey: string, ephemeralPublicKey: string }> {
-  // Convert the hex Pre-Key into a usable CryptoKey
+export async function encryptFileKeyWithX3DH(
+  fileKey: CryptoKey,
+  recipientPreKeyHex: string,
+  recipientIdentityKeyHex: string,
+  senderIdentityPrivateKey: CryptoKey
+): Promise<{ wrappedFileKey: string, ephemeralPublicKey: string }> {
+  // Convert the hex keys into usable CryptoKeys
   const recipientPreKey = await importPublicKey(recipientPreKeyHex);
+  const recipientIdentityKey = await importPublicKey(recipientIdentityKeyHex);
   
   // Alice generates her Ephemeral KeyPair
   const ephemeralPair = await generateIdentityKeyPair();
 
-  // Create Shared Secret using (Alice Ephemeral Private + Bob Public Pre-Key)
-  const sharedKek = await window.crypto.subtle.deriveKey(
-    {
-      name: "ECDH",
-      public: recipientPreKey
-    },
-    ephemeralPair.privateKey,
-    { name: "AES-GCM", length: 256 },
-    true,
-    ["wrapKey", "unwrapKey"]
+  // X3DH Math
+  const dh1 = await deriveRawSecret(senderIdentityPrivateKey, recipientPreKey);
+  const dh2 = await deriveRawSecret(ephemeralPair.privateKey, recipientIdentityKey);
+  const dh3 = await deriveRawSecret(ephemeralPair.privateKey, recipientPreKey);
+
+  const combined = new Uint8Array(dh1.length + dh2.length + dh3.length);
+  combined.set(dh1, 0);
+  combined.set(dh2, dh1.length);
+  combined.set(dh3, dh1.length + dh2.length);
+
+  // SHA-256 KDF to generate Shared KEK
+  const hashBuffer = await window.crypto.subtle.digest('SHA-256', combined);
+  const sharedKek = await window.crypto.subtle.importKey(
+    "raw",
+    hashBuffer,
+    { name: "AES-GCM" },
+    false,
+    ["wrapKey"]
   );
 
   const wrapIv = window.crypto.getRandomValues(new Uint8Array(12));
@@ -208,9 +288,11 @@ export function hexToBytes(hex: string): Uint8Array {
   return bytes;
 }
 
-export async function decryptFileKeyWithPreKey(
+export async function decryptFileKeyWithX3DH(
   wrappedFileKeyHex: string,
   ephemeralPublicKeyHex: string,
+  senderIdentityKeyHex: string,
+  recipientIdentityPrivateKey: CryptoKey,
   encryptedPrivatePreKeyHex: string,
   preKeyIvHex: string,
   kek: CryptoKey
@@ -218,31 +300,39 @@ export async function decryptFileKeyWithPreKey(
   // 1. Unwrap Bob's private pre-key
   const privatePreKey = await window.crypto.subtle.unwrapKey(
     "pkcs8",
-    hexToBytes(encryptedPrivatePreKeyHex),
+    hexToBytes(encryptedPrivatePreKeyHex) as any,
     kek,
-    { name: "AES-GCM", iv: hexToBytes(preKeyIvHex) },
+    { name: "AES-GCM", iv: hexToBytes(preKeyIvHex) as any },
     { name: "ECDH", namedCurve: "P-256" },
     false,
-    ["deriveKey", "deriveBits"]
+    ["deriveBits"]
   );
 
-  // 2. Import Alice's Ephemeral Public Key
+  // 2. Import Alice's Public Keys
   const ephemeralPubKey = await importPublicKey(ephemeralPublicKeyHex);
+  const senderIdentityKey = await importPublicKey(senderIdentityKeyHex);
 
-  // 3. Derive Shared Secret (DH)
-  const sharedKek = await window.crypto.subtle.deriveKey(
-    {
-      name: "ECDH",
-      public: ephemeralPubKey
-    },
-    privatePreKey,
-    { name: "AES-GCM", length: 256 },
-    true,
+  // 3. X3DH Reciprocal Math
+  const dh1 = await deriveRawSecret(privatePreKey, senderIdentityKey);
+  const dh2 = await deriveRawSecret(recipientIdentityPrivateKey, ephemeralPubKey);
+  const dh3 = await deriveRawSecret(privatePreKey, ephemeralPubKey);
+
+  const combined = new Uint8Array(dh1.length + dh2.length + dh3.length);
+  combined.set(dh1, 0);
+  combined.set(dh2, dh1.length);
+  combined.set(dh3, dh1.length + dh2.length);
+
+  // SHA-256 KDF
+  const hashBuffer = await window.crypto.subtle.digest('SHA-256', combined);
+  const sharedKek = await window.crypto.subtle.importKey(
+    "raw",
+    hashBuffer,
+    { name: "AES-GCM" },
+    false,
     ["unwrapKey"]
   );
 
   // 4. Unwrap the file key
-  // Remember: wrapIv was prepended to wrappedKeyBuf (12 bytes)
   const fullWrappedBytes = hexToBytes(wrappedFileKeyHex);
   const wrapIv = fullWrappedBytes.slice(0, 12);
   const wrappedKeyOnly = fullWrappedBytes.slice(12);
@@ -254,7 +344,7 @@ export async function decryptFileKeyWithPreKey(
     { name: "AES-GCM", iv: wrapIv },
     { name: "AES-GCM", length: 256 },
     true,
-    ["decrypt"] // we only need it for decryption now
+    ["decrypt"]
   );
 }
 
@@ -263,9 +353,9 @@ export async function decryptFileData(fileKey: CryptoKey, ciphertextHex: string,
   const ivBytes = hexToBytes(ivHex);
 
   const plainBytes = await window.crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: ivBytes },
+    { name: "AES-GCM", iv: ivBytes as any },
     fileKey,
-    cipherBytes
+    cipherBytes as any
   );
 
   return new TextDecoder().decode(plainBytes);
