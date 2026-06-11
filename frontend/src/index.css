@@ -1,27 +1,203 @@
 @import "tailwindcss";
 
-:root {
-  --primary-color: #22d3ee;     /* Cyan-400 */
-  --secondary-color: #a855f7;   /* Purple-500 */
-  --success-color: #10b981;     /* Emerald-500 */
-  --danger-color: #ef4444;      /* Red-500 */
-  --surface-color: rgba(15, 23, 42, 0.7); /* Dark Glass Slate */
-  --text-primary: #f8fafc;      /* Slate-50 */
-  --text-secondary: #94a3b8;    /* Slate-400 */
-  --surface-border: rgba(255, 255, 255, 0.05);
+:root,
+:root[data-theme="light"] {
+  --brand-navy: #0B103A;
+  --brand-navy-2: #1E2E4D;
+  --brand-cyan: #00C2FF;
+  --brand-teal: #00D69F;
+  --brand-ice: #E6EBF2;
+  --brand-blue: #0052FF;
+
+  --app-bg: #F7FAFD;
+  --app-bg-soft: #EEF4FA;
+  --app-surface: #FFFFFF;
+  --app-surface-muted: #F8FBFE;
+  --app-elevated: #FFFFFF;
+  --app-text: #0B103A;
+  --app-muted: #60708F;
+  --app-subtle: #8A9AB8;
+  --app-border: #DDE6F1;
+  --app-shadow: 0 16px 45px rgba(11, 16, 58, 0.08);
+  --app-field: #F8FBFE;
+  --app-main-bg: linear-gradient(180deg, #F7FAFD 0%, #EEF4FA 100%);
+  --app-sidebar-bg: rgba(248, 251, 254, 0.96);
+  --app-header-bg: rgba(255, 255, 255, 0.92);
+  --brand-logo-text: #0B103A;
+  --brand-icon-surface: #FFFFFF;
+  --brand-icon-shadow: 0 18px 40px rgba(11, 16, 58, 0.16);
+
+  --success-color: #00A873;
+  --danger-color: #E5484D;
+  --warning-color: #D78B00;
+
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
-/* Custom Utilities for the Console Drawer and Animations */
+:root[data-theme="dark"] {
+  --app-bg: #0B103A;
+  --app-bg-soft: #101A42;
+  --app-surface: #101A42;
+  --app-surface-muted: #13224B;
+  --app-elevated: #101E45;
+  --app-text: #F8FBFE;
+  --app-muted: #A8B7CE;
+  --app-subtle: #7485A3;
+  --app-border: rgba(230, 235, 242, 0.13);
+  --app-shadow: 0 18px 50px rgba(0, 0, 0, 0.24);
+  --app-field: #0E1940;
+  --app-main-bg: linear-gradient(180deg, #0B103A 0%, #101A42 54%, #102A57 100%);
+  --app-sidebar-bg: rgba(8, 16, 48, 0.96);
+  --app-header-bg: rgba(11, 16, 58, 0.92);
+  --brand-logo-text: #FFFFFF;
+  --brand-icon-surface: #0B103A;
+  --brand-icon-shadow: 0 18px 40px rgba(0, 0, 0, 0.28);
+}
+
+html {
+  background: var(--app-bg);
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background: var(--app-main-bg);
+  color: var(--app-text);
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
 @layer utilities {
+  .app-shell {
+    background: var(--app-bg);
+    color: var(--app-text);
+  }
+
+  .app-sidebar {
+    background: var(--app-sidebar-bg);
+    border-color: var(--app-border);
+    box-shadow: 8px 0 30px rgba(11, 16, 58, 0.05);
+  }
+
+  .app-header {
+    background: var(--app-header-bg);
+    border-color: var(--app-border);
+    color: var(--app-text);
+  }
+
+  .app-main {
+    background: var(--app-main-bg);
+    color: var(--app-text);
+  }
+
+  .app-card,
+  .brand-panel,
+  .brand-showcase-panel {
+    background: var(--app-surface);
+    border: 1px solid var(--app-border);
+    box-shadow: var(--app-shadow);
+    color: var(--app-text);
+  }
+
+  .brand-dark-panel {
+    background: var(--app-surface);
+    border: 1px solid var(--app-border);
+    box-shadow: var(--app-shadow);
+    color: var(--app-text);
+  }
+
+  .app-field {
+    background: var(--app-field);
+    border: 1px solid var(--app-border);
+    color: var(--app-text);
+  }
+
+  .app-muted {
+    color: var(--app-muted);
+  }
+
+  .brand-logo-wordmark {
+    color: var(--brand-logo-text);
+    font-weight: 500;
+    letter-spacing: -0.015em;
+  }
+
+  .brand-app-icon-surface {
+    fill: var(--brand-icon-surface);
+    filter: drop-shadow(var(--brand-icon-shadow));
+  }
+
+  .brand-gradient-text {
+    color: transparent;
+    background: linear-gradient(90deg, var(--brand-blue), var(--brand-cyan), var(--brand-teal));
+    background-clip: text;
+    -webkit-background-clip: text;
+  }
+
+  .theme-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    border: 1px solid var(--app-border);
+    border-radius: 0.5rem;
+    background: var(--app-surface);
+    color: var(--app-text);
+    padding: 0.625rem 0.8rem;
+    font-size: 0.75rem;
+    font-weight: 800;
+    line-height: 1;
+    text-transform: uppercase;
+    transition: border-color 150ms ease, background 150ms ease, color 150ms ease;
+  }
+
+  .theme-toggle:hover {
+    border-color: color-mix(in srgb, var(--brand-cyan) 55%, var(--app-border));
+  }
+
   .animate-in {
     animation: animate-in 0.5s ease-out;
   }
+
   .fade-in {
     animation-name: fade-in;
   }
+
   .slide-in-from-bottom-4 {
     animation-name: slide-in-from-bottom-4;
   }
+}
+
+.app-main :is(.text-white, .text-slate-100, .text-slate-200, .text-slate-300) {
+  color: var(--app-text) !important;
+}
+
+.app-main :is(.text-slate-400, .text-slate-500, .text-slate-600) {
+  color: var(--app-muted) !important;
+}
+
+.app-main :is(.border-white\/5, .border-white\/10) {
+  border-color: var(--app-border) !important;
+}
+
+.app-main :is(.bg-black\/20, .bg-black\/30, .bg-black\/40, .bg-slate-900, .bg-slate-900\/40, .bg-slate-950, .bg-white\/5) {
+  background-color: var(--app-elevated) !important;
+}
+
+.app-main :is(input, textarea, select) {
+  background-color: var(--app-field) !important;
+  border-color: var(--app-border) !important;
+  color: var(--app-text) !important;
+}
+
+.app-main :is(input, textarea)::placeholder {
+  color: var(--app-subtle) !important;
 }
 
 @keyframes animate-in {

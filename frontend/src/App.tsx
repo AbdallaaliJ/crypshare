@@ -1,8 +1,10 @@
 import React from "react";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { ToastProvider } from "./components/ui/ToastContext";
-import { AuthProvider, useAuth } from "./contexts/AuthContext";
+import { AuthProvider } from "./contexts/AuthContext";
+import { useAuth } from "./hooks/useAuth";
 import { LogProvider } from "./contexts/LogContext";
+import { ThemeProvider } from "./contexts/ThemeContext";
 
 // Layouts
 import { PublicLayout } from "./layouts/PublicLayout";
@@ -12,12 +14,14 @@ import { DashboardLayout } from "./layouts/DashboardLayout";
 import { LandingPage } from "./pages/LandingPage";
 import { LoginPage } from "./pages/LoginPage";
 import { RegisterPage } from "./pages/RegisterPage";
-import { SettingsPage } from "./pages/SettingsPage";
 import { AuditVault } from "./pages/AuditVault";
-
-// Features
-import { SecureUpload } from "./components/SecureUpload";
-import { DecryptionInbox } from "./components/DecryptionInbox";
+import { MyVaultPage } from "./pages/MyVaultPage";
+import { SharedVaultPage } from "./pages/SharedVaultPage";
+import { ContactsPage } from "./pages/ContactsPage";
+import { WorkspaceAdminPage } from "./pages/WorkspaceAdminPage";
+import { SecurityPage } from "./pages/SecurityPage";
+import { OverviewPage } from "./pages/OverviewPage";
+import { P2PTransferPage } from "./pages/P2PTransferPage";
 
 // Protected Route Wrapper
 const ProtectedRoute = ({ children }: { children: React.ReactNode }) => {
@@ -39,10 +43,20 @@ function AppRoutes() {
         </Route>
 
         <Route path="/dashboard" element={<ProtectedRoute><DashboardLayout /></ProtectedRoute>}>
-          <Route path="inbox" element={<DecryptionInbox />} />
-          <Route path="send" element={<SecureUpload />} />
-          <Route path="vault" element={<AuditVault />} />
-          <Route path="settings" element={<SettingsPage />} />
+          <Route index element={<Navigate to="/dashboard/overview" replace />} />
+          <Route path="overview" element={<OverviewPage />} />
+          <Route path="inbox" element={<Navigate to="/dashboard/shared" replace />} />
+          <Route path="send" element={<Navigate to="/dashboard/files" replace />} />
+          <Route path="files" element={<MyVaultPage />} />
+          <Route path="vault" element={<Navigate to="/dashboard/files" replace />} />
+          <Route path="shared" element={<SharedVaultPage />} />
+          <Route path="p2p" element={<P2PTransferPage />} />
+          <Route path="contacts" element={<ContactsPage />} />
+          <Route path="activity" element={<AuditVault />} />
+          <Route path="audit" element={<Navigate to="/dashboard/activity" replace />} />
+          <Route path="workspace-admin" element={<WorkspaceAdminPage />} />
+          <Route path="security" element={<SecurityPage />} />
+          <Route path="settings" element={<Navigate to="/dashboard/security" replace />} />
         </Route>
 
         {/* Fallback */}
@@ -54,13 +68,15 @@ function AppRoutes() {
 
 function App() {
   return (
-    <AuthProvider>
-      <LogProvider>
-        <ToastProvider>
-          <AppRoutes />
-        </ToastProvider>
-      </LogProvider>
-    </AuthProvider>
+    <ThemeProvider>
+      <AuthProvider>
+        <LogProvider>
+          <ToastProvider>
+            <AppRoutes />
+          </ToastProvider>
+        </LogProvider>
+      </AuthProvider>
+    </ThemeProvider>
   );
 }
 

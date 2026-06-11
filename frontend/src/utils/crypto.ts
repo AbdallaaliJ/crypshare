@@ -27,7 +27,7 @@ export async function deriveKEK(password: string, salt: Uint8Array): Promise<Cry
   return window.crypto.subtle.deriveKey(
     {
       name: "PBKDF2",
-      salt: salt as any,
+      salt: salt as BufferSource,
       iterations: 100000,
       hash: "SHA-256"
     },
@@ -36,6 +36,30 @@ export async function deriveKEK(password: string, salt: Uint8Array): Promise<Cry
     true, // extractable
     ["encrypt", "decrypt", "wrapKey", "unwrapKey"]
   );
+}
+
+export async function deriveAuthSecret(password: string, authSalt: Uint8Array): Promise<string> {
+  const enc = new TextEncoder();
+  const keyMaterial = await window.crypto.subtle.importKey(
+    "raw",
+    enc.encode(`crypshare-auth:${password}`),
+    { name: "PBKDF2" },
+    false,
+    ["deriveBits"]
+  );
+
+  const bits = await window.crypto.subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      salt: authSalt as BufferSource,
+      iterations: 150000,
+      hash: "SHA-256"
+    },
+    keyMaterial,
+    256
+  );
+
+  return bytesToHex(new Uint8Array(bits));
 }
 
 /**
@@ -112,7 +136,7 @@ export async function verifySignature(publicKey: CryptoKey, signatureHex: string
   return window.crypto.subtle.verify(
     { name: "ECDSA", hash: { name: "SHA-256" } },
     publicKey,
-    signatureBytes as any,
+    signatureBytes as BufferSource,
     enc.encode(payload)
   );
 }
@@ -121,7 +145,7 @@ export async function importECDSAPublicKey(hexKey: string): Promise<CryptoKey> {
   const keyBytes = hexToBytes(hexKey);
   return window.crypto.subtle.importKey(
     "spki",
-    keyBytes as any,
+    keyBytes as BufferSource,
     { name: "ECDSA", namedCurve: "P-256" },
     true,
     ["verify"]
@@ -137,6 +161,24 @@ export async function deriveRawSecret(privateKey: CryptoKey, publicKey: CryptoKe
   return new Uint8Array(bits);
 }
 
+export async function deriveP2PTransferKey(privateKey: CryptoKey, peerPublicKeyHex: string, sessionId: string): Promise<CryptoKey> {
+  const peerPublicKey = await importPublicKey(peerPublicKeyHex);
+  const sharedSecret = await deriveRawSecret(privateKey, peerPublicKey);
+  const sessionBytes = new TextEncoder().encode(`crypshare-p2p-v1:${sessionId}`);
+  const material = new Uint8Array(sharedSecret.length + sessionBytes.length);
+  material.set(sharedSecret, 0);
+  material.set(sessionBytes, sharedSecret.length);
+  const digest = await window.crypto.subtle.digest('SHA-256', material);
+
+  return window.crypto.subtle.importKey(
+    "raw",
+    digest,
+    { name: "AES-GCM" },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
 export async function unwrapPrivateKey(
   encryptedPrivateKeyHex: string,
   ivHex: string,
@@ -145,9 +187,9 @@ export async function unwrapPrivateKey(
 ): Promise<CryptoKey> {
   return window.crypto.subtle.unwrapKey(
     "pkcs8",
-    hexToBytes(encryptedPrivateKeyHex) as any,
+    hexToBytes(encryptedPrivateKeyHex) as BufferSource,
     kek,
-    { name: "AES-GCM", iv: hexToBytes(ivHex) as any },
+    { name: "AES-GCM", iv: hexToBytes(ivHex) as BufferSource },
     { name: type, namedCurve: "P-256" },
     false,
     type === "ECDH" ? ["deriveBits"] : ["sign"]
@@ -163,6 +205,38 @@ export async function generateFileKey(): Promise<CryptoKey> {
     { name: "AES-GCM", length: 256 },
     true, // Extractable so it can be wrapped
     ["encrypt", "decrypt"]
+  );
+}
+
+export async function wrapFileKeyForOwner(kek: CryptoKey, fileKey: CryptoKey): Promise<{ wrappedFileKey: string, wrappedFileKeyIv: string }> {
+  const iv = window.crypto.getRandomValues(new Uint8Array(12));
+  const wrapped = await window.crypto.subtle.wrapKey(
+    "raw",
+    fileKey,
+    kek,
+    { name: "AES-GCM", iv }
+  );
+
+  return {
+    wrappedFileKey: bytesToHex(new Uint8Array(wrapped)),
+    wrappedFileKeyIv: bytesToHex(iv)
+  };
+}
+
+export async function unwrapFileKeyForOwner(
+  kek: CryptoKey,
+  wrappedFileKeyHex: string,
+  wrappedFileKeyIvHex: string,
+  usages: KeyUsage[] = ["decrypt"]
+): Promise<CryptoKey> {
+  return window.crypto.subtle.unwrapKey(
+    "raw",
+    hexToBytes(wrappedFileKeyHex) as BufferSource,
+    kek,
+    { name: "AES-GCM", iv: hexToBytes(wrappedFileKeyIvHex) as BufferSource },
+    { name: "AES-GCM", length: 256 },
+    true,
+    usages
   );
 }
 
@@ -300,9 +374,9 @@ export async function decryptFileKeyWithX3DH(
   // 1. Unwrap Bob's private pre-key
   const privatePreKey = await window.crypto.subtle.unwrapKey(
     "pkcs8",
-    hexToBytes(encryptedPrivatePreKeyHex) as any,
+    hexToBytes(encryptedPrivatePreKeyHex) as BufferSource,
     kek,
-    { name: "AES-GCM", iv: hexToBytes(preKeyIvHex) as any },
+    { name: "AES-GCM", iv: hexToBytes(preKeyIvHex) as BufferSource },
     { name: "ECDH", namedCurve: "P-256" },
     false,
     ["deriveBits"]
@@ -353,9 +427,9 @@ export async function decryptFileData(fileKey: CryptoKey, ciphertextHex: string,
   const ivBytes = hexToBytes(ivHex);
 
   const plainBytes = await window.crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: ivBytes as any },
+    { name: "AES-GCM", iv: ivBytes as BufferSource },
     fileKey,
-    cipherBytes as any
+    cipherBytes as BufferSource
   );
 
   return new TextDecoder().decode(plainBytes);
@@ -365,8 +439,15 @@ export async function decryptFileData(fileKey: CryptoKey, ciphertextHex: string,
 // Phase 6: Chunked Stream Support
 // ==========================================
 
+export const FILE_CHUNK_SIZE_BYTES = 1024 * 1024 * 5;
+export const ENCRYPTED_CHUNK_OVERHEAD_BYTES = 12 + 16;
+
+export function estimateChunkedEncryptedSize(fileSize: number) {
+  if (fileSize <= 0) return 0;
+  return fileSize + Math.ceil(fileSize / FILE_CHUNK_SIZE_BYTES) * ENCRYPTED_CHUNK_OVERHEAD_BYTES;
+}
+
 export async function encryptFileChunked(fileKey: CryptoKey, file: File): Promise<{ encryptedBlob: Blob, fileIv: string }> {
-  const CHUNK_SIZE = 1024 * 1024 * 5; // 5MB chunks
   const encryptedChunks: Blob[] = [];
   let offset = 0;
   
@@ -374,7 +455,7 @@ export async function encryptFileChunked(fileKey: CryptoKey, file: File): Promis
   const fileIv = bytesToHex(window.crypto.getRandomValues(new Uint8Array(12)));
 
   while (offset < file.size) {
-    const chunk = file.slice(offset, offset + CHUNK_SIZE);
+    const chunk = file.slice(offset, offset + FILE_CHUNK_SIZE_BYTES);
     const chunkBuffer = await chunk.arrayBuffer();
     
     const chunkIv = window.crypto.getRandomValues(new Uint8Array(12));
@@ -387,7 +468,7 @@ export async function encryptFileChunked(fileKey: CryptoKey, file: File): Promis
     // Combine chunkIv and encrypted buffer
     encryptedChunks.push(new Blob([chunkIv, encryptedArrayBuffer]));
     
-    offset += CHUNK_SIZE;
+    offset += FILE_CHUNK_SIZE_BYTES;
   }
   
   return {
@@ -397,7 +478,7 @@ export async function encryptFileChunked(fileKey: CryptoKey, file: File): Promis
 }
 
 export async function decryptFileChunked(fileKey: CryptoKey, encryptedBlob: Blob): Promise<Blob> {
-  const ENCRYPTED_CHUNK_SIZE = (1024 * 1024 * 5) + 16 + 12; 
+  const ENCRYPTED_CHUNK_SIZE = FILE_CHUNK_SIZE_BYTES + ENCRYPTED_CHUNK_OVERHEAD_BYTES; 
   const plainChunks: Blob[] = [];
   let offset = 0;
 

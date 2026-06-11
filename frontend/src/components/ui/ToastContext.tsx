@@ -1,8 +1,7 @@
-import React, { createContext, useContext, useState, type ReactNode } from 'react';
+import React, { useCallback, useMemo, useRef, useState, type ReactNode } from 'react';
 import { X, CheckCircle, AlertCircle, Info } from 'lucide-react';
+import { ToastContext, type ToastType } from './ToastContextBase';
 import './Toast.css'; // We will create this next
-
-type ToastType = 'success' | 'error' | 'info';
 
 interface ToastMessage {
   id: number;
@@ -10,30 +9,28 @@ interface ToastMessage {
   type: ToastType;
 }
 
-interface ToastContextProps {
-  showToast: (message: string, type?: ToastType) => void;
-}
-
-const ToastContext = createContext<ToastContextProps | undefined>(undefined);
-
 export const ToastProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
+  const toastId = useRef(0);
 
-  const showToast = (message: string, type: ToastType = 'info') => {
-    const id = Date.now();
+  const removeToast = useCallback((id: number) => {
+    setToasts((prev) => prev.filter((toast) => toast.id !== id));
+  }, []);
+
+  const showToast = useCallback((message: string, type: ToastType = 'info') => {
+    toastId.current += 1;
+    const id = toastId.current;
     setToasts((prev) => [...prev, { id, message, type }]);
 
     setTimeout(() => {
       removeToast(id);
     }, 5000);
-  };
+  }, [removeToast]);
 
-  const removeToast = (id: number) => {
-    setToasts((prev) => prev.filter((toast) => toast.id !== id));
-  };
+  const contextValue = useMemo(() => ({ showToast }), [showToast]);
 
   return (
-    <ToastContext.Provider value={{ showToast }}>
+    <ToastContext.Provider value={contextValue}>
       {children}
       <div className="toast-container">
         {toasts.map((toast) => (
@@ -52,12 +49,4 @@ export const ToastProvider: React.FC<{ children: ReactNode }> = ({ children }) =
       </div>
     </ToastContext.Provider>
   );
-};
-
-export const useToast = () => {
-  const context = useContext(ToastContext);
-  if (!context) {
-    throw new Error('useToast must be used within a ToastProvider');
-  }
-  return context;
 };

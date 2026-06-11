@@ -1,8 +1,12 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useState, useEffect } from 'react';
 import { FileText, Unlock, Activity } from 'lucide-react';
-import { useToast } from './ui/ToastContext';
-import { useAuth } from '../contexts/AuthContext';
-import { useLogContext } from '../contexts/LogContext';
+import { useToast } from './ui/useToast';
+import { useAuth } from '../hooks/useAuth';
+import { useLogContext } from '../hooks/useLogContext';
+import { apiUrl } from '../config/api';
+import { authHeaders } from '../config/auth';
+import type { DirectoryUser, InboxFile } from '../types/api';
+import { getErrorMessage } from '../utils/errors';
 import {
   decryptFileKeyWithX3DH,
   decryptFileChunked,
@@ -11,34 +15,34 @@ import {
 } from '../utils/crypto';
 
 export const DecryptionInbox: React.FC = () => {
-  const [inboxFiles, setInboxFiles] = useState<any[]>([]);
+  const [inboxFiles, setInboxFiles] = useState<InboxFile[]>([]);
   const [decryptingId, setDecryptingId] = useState<number | null>(null);
   
   const { showToast } = useToast();
   const { user } = useAuth();
   const { addLog, clearLogs } = useLogContext();
 
-  const handleFetchInbox = async () => {
+  const handleFetchInbox = useCallback(async () => {
     if (!user) return;
     try {
-      const r = await fetch(`http://localhost:3001/inbox/${user.username}`);
-      const data = await r.json();
+      const r = await fetch(apiUrl(`/inbox/${user.username}`), { headers: authHeaders(user.token) });
+      const data = await r.json() as { inbox: InboxFile[]; error?: string };
       if (!r.ok) {
         showToast(data.error || 'Failed to fetch inbox', 'error');
         return;
       }
-      setInboxFiles(data.inbox.map((file: any) => ({ ...file, salt: data.salt })));
+      setInboxFiles(data.inbox);
     } catch (err) {
       console.error(err);
       showToast('Error fetching inbox.', 'error');
     }
-  };
+  }, [showToast, user]);
 
   useEffect(() => {
     if (user) handleFetchInbox();
-  }, [user]);
+  }, [user, handleFetchInbox]);
 
-  const handleDecryptFile = async (idx: number, filePayload: any) => {
+  const handleDecryptFile = async (idx: number, filePayload: InboxFile) => {
     if (!user || !user.kek || !user.privateKeyECDH) {
       showToast('Session keys missing. Log in again.', 'error');
       return;
@@ -50,8 +54,8 @@ export const DecryptionInbox: React.FC = () => {
 
     try {
       addLog('Fetching sender ECDSA public key for signature verification...');
-      const usersList = await fetch('http://localhost:3001/users').then(r => r.json());
-      const senderInfo = usersList.find((u: any) => u.username === filePayload.senderUsername);
+      const usersList = await fetch(apiUrl('/users'), { headers: authHeaders(user.token) }).then(r => r.json() as Promise<DirectoryUser[]>);
+      const senderInfo = usersList.find((u) => u.username === filePayload.senderUsername);
       if (!senderInfo) throw new Error('Sender missing from directory. Spoofing detected.');
 
       const senderPubECDSA = await importECDSAPublicKey(senderInfo.identityPublicKeyECDSA);
@@ -74,7 +78,7 @@ export const DecryptionInbox: React.FC = () => {
       );
 
       addLog('Downloading encrypted shards...');
-      const blobRes = await fetch(`http://localhost:3001/download-file/${filePayload.filepath}`);
+      const blobRes = await fetch(apiUrl(`/download-file/${filePayload.filepath}`), { headers: authHeaders(user.token) });
       if (!blobRes.ok) throw new Error('Encrypted file not found.');
 
       addLog('Decrypting and assembling fragments (AES-256-GCM)...');
@@ -97,9 +101,10 @@ export const DecryptionInbox: React.FC = () => {
       // Usually you'd call a backend to mark as read, here we just filter it out.
       setInboxFiles(prev => prev.filter((_, i) => i !== idx));
 
-    } catch (err: any) {
-      addLog(`ERROR: ${err.message}`);
-      showToast('Failed: ' + err.message, 'error');
+    } catch (err: unknown) {
+      const message = getErrorMessage(err, 'Decryption failed.');
+      addLog(`ERROR: ${message}`);
+      showToast('Failed: ' + message, 'error');
     } finally {
       setTimeout(() => setDecryptingId(null), 1000);
     }
