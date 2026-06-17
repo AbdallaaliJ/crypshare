@@ -1,0 +1,35 @@
+services:
+  turn:
+    image: coturn/coturn:4.6
+    restart: unless-stopped
+    networks:
+      turnnet:
+        ipv4_address: 172.30.238.2
+    command:
+      - --listening-ip=0.0.0.0
+      - --listening-port=3478
+      - --relay-ip=172.30.238.2
+      - --external-ip=${TURN_EXTERNAL_IP:-127.0.0.1}/172.30.238.2
+      - --fingerprint
+      - --lt-cred-mech
+      - --realm=${TURN_REALM:-crypshare.local}
+      - --user=${TURN_USERNAME:-crypshare}:${TURN_PASSWORD:-change-this-turn-password}
+      - --allow-loopback-peers
+      - --no-cli
+      - --no-tls
+      - --no-dtls
+      - --min-port=49160
+      - --max-port=49200
+      - --verbose
+      - --log-file=stdout
+    ports:
+      - "3478:3478/tcp"
+      - "3478:3478/udp"
+      - "49160-49200:49160-49200/udp"
+
+networks:
+  turnnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.238.0/24

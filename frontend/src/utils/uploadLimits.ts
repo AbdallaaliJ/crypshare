@@ -5,6 +5,8 @@ export const DEFAULT_UPLOAD_FILE_LIMIT_BYTES = 15 * 1024 * 1024 * 1024;
 export interface UploadLimits {
   uploadFileLimitBytes: number;
   uploadFieldLimitBytes: number;
+  vaultChunkUploadLimitBytes?: number;
+  vaultUploadSessionTtlMs?: number;
   mode: string;
   note: string;
 }
@@ -31,7 +33,9 @@ export async function fetchUploadLimits(): Promise<UploadLimits> {
   return {
     uploadFileLimitBytes: Number(data.uploadFileLimitBytes || DEFAULT_UPLOAD_FILE_LIMIT_BYTES),
     uploadFieldLimitBytes: Number(data.uploadFieldLimitBytes || 262144),
-    mode: data.mode || 'single-request',
-    note: data.note || 'Current public-beta uploads are single encrypted multipart requests.'
+    vaultChunkUploadLimitBytes: Number(data.vaultChunkUploadLimitBytes || 0),
+    vaultUploadSessionTtlMs: Number(data.vaultUploadSessionTtlMs || 0),
+    mode: data.mode || 'resumable-encrypted-chunks',
+    note: data.note || 'Vault uploads use resumable encrypted chunks.'
   };
 }

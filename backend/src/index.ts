@@ -30,13 +30,13 @@ import {
   findSharedVaultFile,
   findVaultFile,
   findVaultFileById,
-  getAuditLog,
-  getAuditSummary,
   getLastAuditHash,
+  getVisibleAuditLog,
   getPreKey,
   getPreKeyStatus,
   getSessionByTokenHash,
   getUser,
+  getVaultStorageBytes,
   getWorkspaceMembership,
   listInbox,
   listDiscoverableUsers,
@@ -62,33 +62,89 @@ import {
 } from "./database";
 import type { InboxRecord, SessionRecord, UserRecord, VaultFileRecord, VaultGrantRecord, VaultGrantSignatureUpdate, WorkspaceMemberRecord } from "./database";
 
-const UPLOAD_DIR = path.join(__dirname, "../uploads");
+const NODE_ENV = process.env.NODE_ENV || "development";
+const PUBLIC_DEPLOYMENT = process.env.CRYPSHARE_PUBLIC_DEPLOYMENT === "true" || NODE_ENV === "production";
+const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(__dirname, "../uploads");
 const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || "256kb";
 const DEFAULT_UPLOAD_FILE_LIMIT_BYTES = 15 * 1024 * 1024 * 1024;
 const UPLOAD_FILE_LIMIT_BYTES = Number(process.env.UPLOAD_FILE_LIMIT_BYTES || DEFAULT_UPLOAD_FILE_LIMIT_BYTES);
 const UPLOAD_FIELD_LIMIT_BYTES = Number(process.env.UPLOAD_FIELD_LIMIT_BYTES || 1024 * 256);
+const VAULT_CHUNK_UPLOAD_LIMIT_BYTES = Number(process.env.VAULT_CHUNK_UPLOAD_LIMIT_BYTES || 8 * 1024 * 1024);
+const VAULT_UPLOAD_SESSION_TTL_MS = Math.max(Number(process.env.VAULT_UPLOAD_SESSION_TTL_MS || 1000 * 60 * 60 * 4), 1000 * 60 * 10);
+const USER_STORAGE_QUOTA_BYTES = Number(process.env.USER_STORAGE_QUOTA_BYTES || 100 * 1024 * 1024 * 1024);
 const GENERAL_RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 1000 * 60);
 const GENERAL_RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 600);
 const AUTH_RATE_LIMIT_WINDOW_MS = Number(process.env.AUTH_RATE_LIMIT_WINDOW_MS || 1000 * 60 * 5);
 const AUTH_RATE_LIMIT_MAX = Number(process.env.AUTH_RATE_LIMIT_MAX || 30);
 const WORKSPACE_INVITE_TTL_MS = Math.max(Number(process.env.WORKSPACE_INVITE_TTL_MS || 1000 * 60 * 60 * 24 * 7), 1000 * 60 * 5);
+const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 1000 * 60 * 60 * 8);
+const SESSION_COOKIE_ENABLED = process.env.SESSION_COOKIE_ENABLED === "true";
+const SESSION_COOKIE_NAME = process.env.SESSION_COOKIE_NAME || "__Host-crypshare_session";
+const CSRF_COOKIE_NAME = process.env.CSRF_COOKIE_NAME || "__Host-crypshare_csrf";
+const CSRF_HEADER_NAME = (process.env.CSRF_HEADER_NAME || "x-csrf-token").toLowerCase();
+const SESSION_COOKIE_SECRET = process.env.SESSION_COOKIE_SECRET || (PUBLIC_DEPLOYMENT ? "" : "dev-only-crypshare-cookie-secret-change-for-production");
+const SESSION_COOKIE_SECURE = process.env.SESSION_COOKIE_SECURE
+  ? process.env.SESSION_COOKIE_SECURE === "true"
+  : PUBLIC_DEPLOYMENT;
+const SESSION_COOKIE_SAMESITE = (process.env.SESSION_COOKIE_SAMESITE || "strict").toLowerCase();
+const SESSION_RETURN_BEARER_TOKEN = process.env.SESSION_RETURN_BEARER_TOKEN !== "false";
 const P2P_SESSION_TTL_MS = Math.max(Number(process.env.P2P_SESSION_TTL_MS || 1000 * 60 * 15), 1000 * 60);
-const P2P_STUN_URLS = (process.env.P2P_STUN_URLS || "stun:stun.l.google.com:19302")
+const P2P_STUN_URLS = (process.env.P2P_STUN_URLS || "")
   .split(",")
   .map((url) => url.trim())
   .filter(Boolean);
-const P2P_TURN_URLS = (process.env.P2P_TURN_URLS || "")
+const P2P_TURN_URLS = (process.env.P2P_TURN_URLS || "turn:127.0.0.1:3478?transport=udp,turn:127.0.0.1:3478?transport=tcp")
   .split(",")
   .map((url) => url.trim())
   .filter(Boolean);
-const P2P_TURN_USERNAME = process.env.P2P_TURN_USERNAME || "";
-const P2P_TURN_CREDENTIAL = process.env.P2P_TURN_CREDENTIAL || "";
+const P2P_TURN_USERNAME = process.env.P2P_TURN_USERNAME || "crypshare";
+const P2P_TURN_CREDENTIAL = process.env.P2P_TURN_CREDENTIAL || "change-this-turn-password";
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || "")
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
 
+function validateRuntimeConfig() {
+  if (!PUBLIC_DEPLOYMENT) return;
+
+  const failures: string[] = [];
+  if (CORS_ORIGINS.length === 0) {
+    failures.push("CORS_ORIGINS must be set for public deployments.");
+  }
+  if (!process.env.DATABASE_FILE) {
+    failures.push("DATABASE_FILE must be set to a durable production database path.");
+  }
+  if (!process.env.UPLOAD_DIR) {
+    failures.push("UPLOAD_DIR must be set to a durable encrypted blob storage path.");
+  }
+  if (P2P_TURN_URLS.length === 0) {
+    failures.push("P2P_TURN_URLS must be configured because P2P is relay-only.");
+  }
+  if (!process.env.P2P_TURN_USERNAME || !process.env.P2P_TURN_CREDENTIAL) {
+    failures.push("P2P_TURN_USERNAME and P2P_TURN_CREDENTIAL must be explicitly configured.");
+  }
+  if (P2P_TURN_USERNAME === "crypshare" || P2P_TURN_CREDENTIAL === "change-this-turn-password") {
+    failures.push("Default TURN credentials are not allowed in public deployments.");
+  }
+  if (SESSION_TTL_MS > 1000 * 60 * 60 * 24) {
+    failures.push("SESSION_TTL_MS should be 24 hours or less for public deployments.");
+  }
+  if (SESSION_COOKIE_ENABLED && SESSION_COOKIE_SECRET.length < 32) {
+    failures.push("SESSION_COOKIE_SECRET must be at least 32 characters when session cookies are enabled.");
+  }
+  if (!SESSION_COOKIE_ENABLED && !SESSION_RETURN_BEARER_TOKEN) {
+    failures.push("SESSION_RETURN_BEARER_TOKEN=false requires SESSION_COOKIE_ENABLED=true.");
+  }
+
+  if (failures.length > 0) {
+    throw new Error(`Unsafe CrypShare production configuration:\n- ${failures.join("\n- ")}`);
+  }
+}
+
+validateRuntimeConfig();
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+const VAULT_CHUNK_SESSION_DIR = path.join(UPLOAD_DIR, ".chunk-sessions");
+fs.mkdirSync(VAULT_CHUNK_SESSION_DIR, { recursive: true });
 
 const uploadMiddleware = multer({
   dest: UPLOAD_DIR,
@@ -99,9 +155,32 @@ const uploadMiddleware = multer({
     fields: 32
   }
 });
+const chunkUploadMiddleware = multer({
+  dest: VAULT_CHUNK_SESSION_DIR,
+  limits: {
+    fileSize: VAULT_CHUNK_UPLOAD_LIMIT_BYTES,
+    fields: 8,
+    files: 1
+  }
+});
 export const app = express();
 const PORT = Number(process.env.PORT || 3001);
-const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 1000 * 60 * 60 * 8);
+const vaultUploadSessions = new Map<string, {
+  id: string;
+  ownerUsername: string;
+  encryptedMetadata: string;
+  metadataIv: string;
+  wrappedFileKey: string;
+  wrappedFileKeyIv: string;
+  expectedChunks: number;
+  expectedSize: number;
+  receivedChunks: Set<number>;
+  dir: string;
+  createdAt: number;
+  expiresAt: number;
+}>();
+const vaultUploadCleanupInterval = setInterval(cleanupExpiredVaultUploadSessions, Math.min(VAULT_UPLOAD_SESSION_TTL_MS, 1000 * 60 * 15));
+vaultUploadCleanupInterval.unref?.();
 const p2pClients = new Map<string, Set<WebSocket>>();
 const p2pSessions = new Map<string, {
   id: string;
@@ -113,8 +192,10 @@ const p2pSessions = new Map<string, {
 }>();
 
 app.disable("x-powered-by");
+app.disable("etag");
 app.use(cors({
-  origin: CORS_ORIGINS.length > 0 ? CORS_ORIGINS : true
+  origin: CORS_ORIGINS.length > 0 ? CORS_ORIGINS : true,
+  credentials: SESSION_COOKIE_ENABLED
 }));
 app.use(requestContext);
 app.use(securityHeaders);
@@ -122,16 +203,26 @@ app.use(createRateLimiter("general", GENERAL_RATE_LIMIT_WINDOW_MS, GENERAL_RATE_
 app.use(requestLogger);
 app.use(express.json({ limit: JSON_BODY_LIMIT }));
 
-interface AuditEntry {
-  timestamp: number;
-  userId: string;
-  action: string;
-  previousHash: string;
-  hash: string;
-}
+app.get("/", (_req, res) => {
+  res.json({
+    name: "CrypShare API",
+    status: "ok",
+    health: "/health",
+    note: "Open the Vite frontend URL to use the app. This backend serves API and WebSocket routes."
+  });
+});
 
 const GENESIS_HASH = "0".repeat(64);
 const rateLimitBuckets = new Map<string, { count: number; resetAt: number }>();
+const P2P_SIGNALING_TICKET_TTL_MS = 60_000;
+const p2pSignalingTickets = new Map<string, { username: string; expiresAt: number }>();
+
+interface AuditContext {
+  actorId?: string;
+  subjectId?: string;
+  workspaceId?: string;
+  visibility?: "user" | "workspace";
+}
 
 function getClientId(req: express.Request) {
   return req.ip || req.socket.remoteAddress || "unknown";
@@ -187,6 +278,8 @@ function securityHeaders(_req: express.Request, res: express.Response, next: exp
   res.setHeader("Referrer-Policy", "no-referrer");
   res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
   res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'");
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Pragma", "no-cache");
   next();
 }
 
@@ -207,6 +300,24 @@ function requestLogger(req: express.Request, res: express.Response, next: expres
 
 function sha256Hex(value: string) {
   return crypto.createHash("sha256").update(value).digest("hex");
+}
+
+function identityFingerprintFor(username: string, userRecord: UserRecord) {
+  return sha256Hex([
+    "crypshare-identity-v1",
+    username,
+    userRecord.identityPublicKeyECDH,
+    userRecord.identityPublicKeyECDSA
+  ].join(":"));
+}
+
+function normalizeFingerprint(value: unknown) {
+  return typeof value === "string" ? value.replace(/[^a-f0-9]/gi, "").toLowerCase() : "";
+}
+
+function fingerprintAllowsIdentityAccess(username: string, userRecord: UserRecord, candidate: unknown) {
+  const normalizedCandidate = normalizeFingerprint(candidate);
+  return normalizedCandidate.length >= 32 && identityFingerprintFor(username, userRecord).startsWith(normalizedCandidate);
 }
 
 function safeCompareHex(a: string, b: string) {
@@ -242,6 +353,71 @@ function removeUploadedFile(filename?: string) {
   if (fs.existsSync(uploadedPath)) {
     fs.unlinkSync(uploadedPath);
   }
+}
+
+function removeMulterFile(file?: Express.Multer.File) {
+  if (!file?.path) return;
+  fs.rmSync(file.path, { force: true });
+}
+
+function removePathRecursive(targetPath: string) {
+  if (!targetPath.startsWith(VAULT_CHUNK_SESSION_DIR)) return;
+  fs.rmSync(targetPath, { recursive: true, force: true });
+}
+
+function cleanupExpiredVaultUploadSessions() {
+  const now = Date.now();
+  for (const [id, session] of vaultUploadSessions.entries()) {
+    if (session.expiresAt <= now) {
+      removePathRecursive(session.dir);
+      vaultUploadSessions.delete(id);
+    }
+  }
+}
+
+function storageQuotaSnapshot(username: string, incomingBytes = 0, replacingBytes = 0) {
+  const usedBytes = getVaultStorageBytes(username);
+  const quotaBytes = USER_STORAGE_QUOTA_BYTES;
+  const projectedBytes = Math.max(usedBytes - replacingBytes, 0) + incomingBytes;
+  return {
+    usedBytes,
+    quotaBytes,
+    availableBytes: Math.max(quotaBytes - usedBytes, 0),
+    projectedBytes,
+    allowed: quotaBytes <= 0 || projectedBytes <= quotaBytes
+  };
+}
+
+function chunkPath(session: { dir: string }, index: number) {
+  return path.join(session.dir, `${index}.chunk`);
+}
+
+function pipeFileToStream(sourcePath: string, target: fs.WriteStream) {
+  return new Promise<void>((resolve, reject) => {
+    const source = fs.createReadStream(sourcePath);
+    source.on("error", reject);
+    target.on("error", reject);
+    source.on("end", resolve);
+    source.pipe(target, { end: false });
+  });
+}
+
+async function assembleVaultChunks(session: { dir: string; expectedChunks: number }, finalPath: string) {
+  const target = fs.createWriteStream(finalPath, { flags: "wx" });
+  try {
+    for (let index = 0; index < session.expectedChunks; index += 1) {
+      await pipeFileToStream(chunkPath(session, index), target);
+    }
+  } catch (err) {
+    target.destroy();
+    fs.rmSync(finalPath, { force: true });
+    throw err;
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    target.end(() => resolve());
+    target.on("error", reject);
+  });
 }
 
 function buildVaultGrant(ownerUsername: string, vaultFileId: string, input: Partial<VaultGrantRecord>) {
@@ -296,7 +472,7 @@ function createSession(username: string, userAgent: string) {
   const createdAt = Date.now();
   const expiresAt = Date.now() + SESSION_TTL_MS;
   createSessionRecord(tokenHash, { id, username, createdAt, expiresAt, userAgent });
-  return { token, id, expiresAt };
+  return { token, tokenHash, id, expiresAt };
 }
 
 function cleanupExpiredSessions() {
@@ -308,12 +484,100 @@ function getBearerToken(req: express.Request) {
   return authHeader?.startsWith("Bearer ") ? authHeader.slice("Bearer ".length) : "";
 }
 
-function getSession(req: express.Request) {
-  const token = getBearerToken(req);
-  return getSessionFromToken(token);
+function parseCookies(req: express.Request) {
+  const header = req.headers.cookie || "";
+  const cookies = new Map<string, string>();
+  for (const part of header.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator === -1) continue;
+    const name = part.slice(0, separator).trim();
+    const value = part.slice(separator + 1).trim();
+    if (!name) continue;
+    cookies.set(name, decodeURIComponent(value));
+  }
+  return cookies;
 }
 
-function getSessionFromToken(token: string) {
+function getCookieToken(req: express.Request) {
+  if (!SESSION_COOKIE_ENABLED) return "";
+  return parseCookies(req).get(SESSION_COOKIE_NAME) || "";
+}
+
+function cookieSameSite() {
+  return SESSION_COOKIE_SAMESITE === "lax" || SESSION_COOKIE_SAMESITE === "none" ? SESSION_COOKIE_SAMESITE : "strict";
+}
+
+function cookieAttributes(options: { httpOnly: boolean; maxAgeMs?: number }) {
+  const attributes = [
+    "Path=/",
+    `SameSite=${cookieSameSite()}`,
+    options.httpOnly ? "HttpOnly" : "",
+    SESSION_COOKIE_SECURE ? "Secure" : "",
+    options.maxAgeMs !== undefined ? `Max-Age=${Math.max(Math.floor(options.maxAgeMs / 1000), 0)}` : ""
+  ].filter(Boolean);
+
+  return attributes.join("; ");
+}
+
+function setCookie(res: express.Response, name: string, value: string, options: { httpOnly: boolean; maxAgeMs?: number }) {
+  res.append("Set-Cookie", `${name}=${encodeURIComponent(value)}; ${cookieAttributes(options)}`);
+}
+
+function clearCookie(res: express.Response, name: string, httpOnly: boolean) {
+  setCookie(res, name, "", { httpOnly, maxAgeMs: 0 });
+}
+
+function signCsrfToken(csrfNonce: string, tokenHash: string) {
+  if (!SESSION_COOKIE_SECRET) return "";
+  return crypto
+    .createHmac("sha256", SESSION_COOKIE_SECRET)
+    .update(`${csrfNonce}:${tokenHash}`)
+    .digest("hex");
+}
+
+function createCsrfToken(tokenHash: string) {
+  const nonce = crypto.randomBytes(16).toString("hex");
+  const signature = signCsrfToken(nonce, tokenHash);
+  return `${nonce}.${signature}`;
+}
+
+function safeCompareString(left: string, right: string) {
+  const leftBuffer = Buffer.from(left);
+  const rightBuffer = Buffer.from(right);
+  return leftBuffer.length === rightBuffer.length && crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function validateCsrfToken(candidate: string, tokenHash: string) {
+  const [nonce, signature] = candidate.split(".");
+  if (!nonce || !signature || !/^[a-f0-9]{32}$/i.test(nonce) || !/^[a-f0-9]{64}$/i.test(signature)) return false;
+  return safeCompareString(signature, signCsrfToken(nonce, tokenHash));
+}
+
+function setSessionCookies(res: express.Response, token: string, tokenHash: string, expiresAt: number) {
+  if (!SESSION_COOKIE_ENABLED) return "";
+
+  const maxAgeMs = Math.max(expiresAt - Date.now(), 0);
+  const csrfToken = createCsrfToken(tokenHash);
+  setCookie(res, SESSION_COOKIE_NAME, token, { httpOnly: true, maxAgeMs });
+  setCookie(res, CSRF_COOKIE_NAME, csrfToken, { httpOnly: false, maxAgeMs });
+  return csrfToken;
+}
+
+function clearSessionCookies(res: express.Response) {
+  if (!SESSION_COOKIE_ENABLED) return;
+  clearCookie(res, SESSION_COOKIE_NAME, true);
+  clearCookie(res, CSRF_COOKIE_NAME, false);
+}
+
+function getSession(req: express.Request) {
+  const bearerToken = getBearerToken(req);
+  if (bearerToken) return getSessionFromToken(bearerToken, "bearer");
+
+  const cookieToken = getCookieToken(req);
+  return getSessionFromToken(cookieToken, "cookie");
+}
+
+function getSessionFromToken(token: string, source: "bearer" | "cookie") {
   if (!token) return null;
 
   const tokenHash = sha256Hex(token);
@@ -325,7 +589,26 @@ function getSessionFromToken(token: string) {
     return null;
   }
 
-  return { token, tokenHash, session };
+  return { token, tokenHash, session, source };
+}
+
+function isCsrfSafeMethod(method: string) {
+  return ["GET", "HEAD", "OPTIONS"].includes(method.toUpperCase());
+}
+
+function requireCookieCsrf(req: express.Request, res: express.Response, tokenHash: string) {
+  if (isCsrfSafeMethod(req.method)) return true;
+
+  const cookies = parseCookies(req);
+  const cookieToken = cookies.get(CSRF_COOKIE_NAME) || "";
+  const headerToken = typeof req.headers[CSRF_HEADER_NAME] === "string" ? req.headers[CSRF_HEADER_NAME] as string : "";
+
+  if (!cookieToken || !headerToken || !safeCompareString(cookieToken, headerToken) || !validateCsrfToken(headerToken, tokenHash)) {
+    res.status(403).json({ error: "CSRF verification failed" });
+    return false;
+  }
+
+  return true;
 }
 
 function listUserSessions(username: string, currentSessionId: string) {
@@ -348,6 +631,10 @@ function requireAuth(req: express.Request, res: express.Response, next: express.
   const authSession = getSession(req);
   if (!authSession) {
     res.status(401).json({ error: "Authentication required" });
+    return;
+  }
+
+  if (authSession.source === "cookie" && !requireCookieCsrf(req, res, authSession.tokenHash)) {
     return;
   }
 
@@ -422,15 +709,61 @@ function requireWorkspaceOwner(workspaceId: string, username: string) {
   return membership;
 }
 
-function appendAuditLog(userId: string, action: string) {
+function appendAuditLog(userId: string, action: string, context: AuditContext = {}) {
   const previousHash = getLastAuditHash() || GENESIS_HASH;
   const timestamp = Date.now();
   
-  const payload = JSON.stringify([timestamp, userId, action]) + previousHash;
+  const actorId = context.actorId || userId;
+  const subjectId = context.subjectId || userId;
+  const workspaceId = context.workspaceId || null;
+  const visibility = context.visibility || "user";
+  const payload = JSON.stringify([timestamp, userId, action, actorId, subjectId, workspaceId, visibility]) + previousHash;
   const hash = crypto.createHash('sha256').update(payload).digest('hex');
   
-  appendAuditEntry({ timestamp, userId, action, previousHash, hash });
+  appendAuditEntry({ timestamp, userId, action, previousHash, hash, actorId, subjectId, workspaceId, visibility });
   console.log(`[AUDIT LOG] ${action} -> [Hash: ${hash.substring(0, 8)}...]`);
+}
+
+function visibleAuditHashPayload(entry: ReturnType<typeof getVisibleAuditLog>[number]) {
+  return JSON.stringify([
+    entry.timestamp,
+    entry.userId,
+    entry.action,
+    entry.actorId || entry.userId,
+    entry.subjectId || entry.userId,
+    entry.workspaceId || null,
+    entry.visibility || "user"
+  ]);
+}
+
+function buildVisibleAuditView(username: string) {
+  const adminWorkspaceIds = listWorkspacesForUser(username)
+    .filter((workspace) => workspace.status === "active" && ["owner", "admin"].includes(workspace.role || ""))
+    .map((workspace) => workspace.id);
+  const visibleEntries = getVisibleAuditLog(username, adminWorkspaceIds);
+  let previousHash = GENESIS_HASH;
+
+  return visibleEntries.map((entry) => {
+    const hash = sha256Hex(visibleAuditHashPayload(entry) + previousHash);
+    const visibleEntry = {
+      ...entry,
+      previousHash,
+      hash
+    };
+    previousHash = hash;
+    return visibleEntry;
+  });
+}
+
+function visibleAuditSummary(entries: ReturnType<typeof buildVisibleAuditView>) {
+  const latestEntry = entries.length > 0 ? entries[entries.length - 1] : null;
+  return {
+    blockCount: entries.length,
+    firstTimestamp: entries[0]?.timestamp || null,
+    latestTimestamp: latestEntry?.timestamp || null,
+    firstHash: entries[0]?.hash || null,
+    latestHash: latestEntry?.hash || null
+  };
 }
 // -------------------------------------
 
@@ -496,6 +829,39 @@ function sendP2PError(socket: WebSocket, error: string, sessionId?: string) {
   }
 }
 
+function cleanupP2PSignalingTickets() {
+  const now = Date.now();
+  for (const [ticketHash, ticket] of p2pSignalingTickets.entries()) {
+    if (ticket.expiresAt <= now) {
+      p2pSignalingTickets.delete(ticketHash);
+    }
+  }
+}
+
+function createP2PSignalingTicket(username: string) {
+  cleanupP2PSignalingTickets();
+  const ticket = crypto.randomBytes(32).toString("base64url");
+  const ticketHash = sha256Hex(ticket);
+  const expiresAt = Date.now() + P2P_SIGNALING_TICKET_TTL_MS;
+  p2pSignalingTickets.set(ticketHash, {
+    username,
+    expiresAt
+  });
+  return {
+    ticket,
+    expiresAt
+  };
+}
+
+function consumeP2PSignalingTicket(ticket: string) {
+  cleanupP2PSignalingTickets();
+  const ticketHash = sha256Hex(ticket);
+  const record = p2pSignalingTickets.get(ticketHash);
+  p2pSignalingTickets.delete(ticketHash);
+  if (!record || record.expiresAt <= Date.now()) return null;
+  return record.username;
+}
+
 function getP2PSessionForUser(sessionId: unknown, username: string) {
   if (typeof sessionId !== "string") return null;
   cleanupExpiredP2PSessions();
@@ -511,28 +877,33 @@ function attachP2PSignaling(server: http.Server) {
     const requestUrl = new URL(req.url || "", `http://${req.headers.host || "localhost"}`);
     if (requestUrl.pathname !== "/p2p/signaling") return;
 
-    const token = requestUrl.searchParams.get("token") || "";
-    const authSession = getSessionFromToken(token);
-    if (!authSession) {
+    const ticket = requestUrl.searchParams.get("ticket") || "";
+    const ticketUsername = ticket ? consumeP2PSignalingTicket(ticket) : null;
+    if (!ticketUsername) {
       socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
       socket.destroy();
       return;
     }
 
-    const userRecord = getUser(authSession.session.username);
+    const userRecord = getUser(ticketUsername);
     if (!userRecord || userRecord.revokedAt) {
-      deleteSessionByTokenHash(authSession.tokenHash);
       socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
       socket.destroy();
       return;
     }
 
     websocketServer.handleUpgrade(req, socket, head, (ws) => {
-      websocketServer.emit("connection", ws, req, authSession.session.username);
+      websocketServer.emit("connection", ws, req, ticketUsername);
     });
   });
 
   websocketServer.on("connection", (socket: WebSocket, _req: http.IncomingMessage, username: string) => {
+    const userRecord = getUser(username);
+    if (!userRecord || userRecord.revokedAt) {
+      socket.close();
+      return;
+    }
+
     addP2PClient(username, socket);
     socket.send(JSON.stringify({ type: "p2p-ready", username }));
 
@@ -559,6 +930,11 @@ function attachP2PSignaling(server: http.Server) {
           sendP2PError(socket, "Recipient identity is unavailable.");
           return;
         }
+        const usersShareWorkspace = usersShareActiveWorkspace(username, recipientUsername);
+        if (!usersShareWorkspace && !fingerprintAllowsIdentityAccess(recipientUsername, recipient, message.recipientFingerprint)) {
+          sendP2PError(socket, "Recipient identity invite fingerprint is required for unknown-user P2P.");
+          return;
+        }
 
         const sessionId = crypto.randomUUID();
         const session = {
@@ -570,23 +946,33 @@ function attachP2PSignaling(server: http.Server) {
           expiresAt: Date.now() + P2P_SESSION_TTL_MS
         };
         p2pSessions.set(sessionId, session);
-        appendAuditLog(username, "P2P Invite Created");
+        appendAuditLog(username, "P2P Invite Created", {
+          actorId: username,
+          subjectId: recipientUsername
+        });
 
+        socket.send(JSON.stringify({
+          type: "p2p-invite-created",
+          sessionId,
+          recipientUsername,
+          delivered: false,
+          relayAllowed: session.relayAllowed,
+          expiresAt: session.expiresAt
+        }));
         const delivered = routeP2PMessage(recipientUsername, {
           type: "p2p-invite",
           sessionId,
           senderUsername: username,
+          senderFingerprint: identityFingerprintFor(username, userRecord),
           relayAllowed: session.relayAllowed,
           createdAt: session.createdAt,
           expiresAt: session.expiresAt
         });
         socket.send(JSON.stringify({
-          type: "p2p-invite-created",
+          type: "p2p-invite-delivery",
           sessionId,
           recipientUsername,
-          delivered,
-          relayAllowed: session.relayAllowed,
-          expiresAt: session.expiresAt
+          delivered
         }));
         return;
       }
@@ -600,7 +986,10 @@ function attachP2PSignaling(server: http.Server) {
 
         if (message.type === "p2p-decline") {
           p2pSessions.delete(session.id);
-          appendAuditLog(username, "P2P Declined");
+          appendAuditLog(username, "P2P Declined", {
+            actorId: username,
+            subjectId: session.senderUsername
+          });
           routeP2PMessage(session.senderUsername, {
             type: "p2p-declined",
             sessionId: session.id,
@@ -609,7 +998,10 @@ function attachP2PSignaling(server: http.Server) {
           return;
         }
 
-        appendAuditLog(username, "P2P Accepted");
+        appendAuditLog(username, "P2P Accepted", {
+          actorId: username,
+          subjectId: session.senderUsername
+        });
         routeP2PMessage(session.senderUsername, {
           type: "p2p-accepted",
           sessionId: session.id,
@@ -632,22 +1024,39 @@ function attachP2PSignaling(server: http.Server) {
         }
 
         if (signalType === "completed") {
-          appendAuditLog(username, "P2P Completed");
+          appendAuditLog(username, "P2P Completed", {
+            actorId: username,
+            subjectId: username === session.senderUsername ? session.recipientUsername : session.senderUsername
+          });
           p2pSessions.delete(session.id);
         }
         if (signalType === "failed") {
-          appendAuditLog(username, "P2P Failed");
+          appendAuditLog(username, "P2P Failed", {
+            actorId: username,
+            subjectId: username === session.senderUsername ? session.recipientUsername : session.senderUsername
+          });
           p2pSessions.delete(session.id);
         }
 
         const targetUsername = username === session.senderUsername ? session.recipientUsername : session.senderUsername;
-        routeP2PMessage(targetUsername, {
+        const delivered = routeP2PMessage(targetUsername, {
           type: "p2p-signal",
           sessionId: session.id,
           fromUsername: username,
           signalType,
           payload: message.payload || null
         });
+        console.log(JSON.stringify({
+          event: "p2p_signal",
+          sessionId: session.id,
+          from: username,
+          to: targetUsername,
+          signalType,
+          delivered
+        }));
+        if (!delivered && signalType !== "failed" && signalType !== "completed") {
+          sendP2PError(socket, "Peer is no longer connected.", session.id);
+        }
       }
     });
 
@@ -667,30 +1076,34 @@ app.get("/upload-limits", (req, res) => {
   res.json({
     uploadFileLimitBytes: UPLOAD_FILE_LIMIT_BYTES,
     uploadFieldLimitBytes: UPLOAD_FIELD_LIMIT_BYTES,
-    mode: "single-request",
-    note: "Current public-beta uploads are single encrypted multipart requests. Multi-terabyte files need resumable encrypted chunk upload."
+    vaultChunkUploadLimitBytes: VAULT_CHUNK_UPLOAD_LIMIT_BYTES,
+    vaultUploadSessionTtlMs: VAULT_UPLOAD_SESSION_TTL_MS,
+    mode: "resumable-encrypted-chunks",
+    note: "Vault uploads use resumable encrypted chunks. The server stores encrypted bytes only; multi-terabyte deployments still need durable object storage."
   });
 });
 
 app.get("/p2p/ice-config", requireAuth, (_req, res) => {
-  const iceServers: RTCIceServer[] = [];
-  if (P2P_STUN_URLS.length > 0) {
-    iceServers.push({ urls: P2P_STUN_URLS });
-  }
-  if (P2P_TURN_URLS.length > 0 && P2P_TURN_USERNAME && P2P_TURN_CREDENTIAL) {
-    iceServers.push({
-      urls: P2P_TURN_URLS,
-      username: P2P_TURN_USERNAME,
-      credential: P2P_TURN_CREDENTIAL
-    });
-  }
-
+  const turnConfigured = P2P_TURN_URLS.length > 0 && !!P2P_TURN_USERNAME && !!P2P_TURN_CREDENTIAL;
+  const turnServers: RTCIceServer[] = turnConfigured ? [{
+    urls: P2P_TURN_URLS,
+    username: P2P_TURN_USERNAME,
+    credential: P2P_TURN_CREDENTIAL
+  }] : [];
   res.json({
-    iceServers,
-    directOnlyIceServers: P2P_STUN_URLS.length > 0 ? [{ urls: P2P_STUN_URLS }] : [],
-    turnConfigured: P2P_TURN_URLS.length > 0 && !!P2P_TURN_USERNAME && !!P2P_TURN_CREDENTIAL,
+    iceServers: turnServers,
+    turnConfigured,
+    relayOnly: true,
     sessionTtlMs: P2P_SESSION_TTL_MS,
-    privacyNote: "CrypShare signaling does not store file bytes, file names, file types, or decrypted metadata."
+    privacyNote: "P2P uses TURN relay-only mode. TURN can see IPs, timing, and packet sizes, but CrypShare encrypts file metadata and chunks before WebRTC sends them."
+  });
+});
+
+app.post("/p2p/signaling-ticket", requireAuth, (_req, res) => {
+  const ticket = createP2PSignalingTicket(res.locals.authUsername);
+  res.json({
+    ...ticket,
+    ttlMs: P2P_SIGNALING_TICKET_TTL_MS
   });
 });
 
@@ -703,6 +1116,13 @@ app.get("/p2p/identity/:username", requireAuth, (req, res) => {
   const userRecord = getUser(req.params.username);
   if (!userRecord || userRecord.revokedAt) {
     res.status(userRecord?.revokedAt ? 410 : 404).json({ error: "P2P identity unavailable" });
+    return;
+  }
+
+  const sharedWorkspace = usersShareActiveWorkspace(res.locals.authUsername, req.params.username);
+  const inviteFingerprint = req.query.fingerprint;
+  if (req.params.username !== res.locals.authUsername && !sharedWorkspace && !fingerprintAllowsIdentityAccess(req.params.username, userRecord, inviteFingerprint)) {
+    res.status(403).json({ error: "Identity invite fingerprint required for unknown-user P2P" });
     return;
   }
 
@@ -806,8 +1226,15 @@ app.post("/sessions", authRateLimiter, (req, res) => {
   }
 
   const session = createSession(username, req.get("user-agent") || "Unknown client");
+  const csrfToken = setSessionCookies(res, session.token, session.tokenHash, session.expiresAt);
   appendAuditLog(username, "Session Established");
-  res.json(session);
+  res.json({
+    token: SESSION_RETURN_BEARER_TOKEN ? session.token : undefined,
+    id: session.id,
+    expiresAt: session.expiresAt,
+    csrfToken: csrfToken || undefined,
+    cookieSession: SESSION_COOKIE_ENABLED
+  });
 });
 
 app.get("/sessions", requireAuth, (req, res) => {
@@ -818,6 +1245,7 @@ app.get("/sessions", requireAuth, (req, res) => {
 
 app.delete("/sessions/current", requireAuth, (req, res) => {
   deleteSessionByTokenHash(res.locals.authTokenHash);
+  clearSessionCookies(res);
   appendAuditLog(res.locals.authUsername, "Session Revoked");
   res.json({ message: "Current session revoked" });
 });
@@ -863,6 +1291,7 @@ app.post("/identity/:username/revoke", requireAuth, requireSelf, (req, res) => {
   }
 
   const revokedSessions = revokeAllSessions(username);
+  clearSessionCookies(res);
   appendAuditLog(username, "Identity Revoked");
   res.json({ message: "Identity revoked", revokedAt: revocation.revokedAt, revokedSessions });
 });
@@ -929,7 +1358,12 @@ app.post("/workspaces", requireAuth, (req, res) => {
   };
 
   const ownerMembership = createWorkspace(workspace, res.locals.authUsername);
-  appendAuditLog(res.locals.authUsername, "Workspace Created");
+  appendAuditLog(res.locals.authUsername, "Workspace Created", {
+    actorId: res.locals.authUsername,
+    subjectId: res.locals.authUsername,
+    workspaceId: workspace.id,
+    visibility: "workspace"
+  });
   res.json({ workspace: { ...workspace, role: ownerMembership?.role, status: ownerMembership?.status, memberCount: 1, pendingCount: 0 } });
 });
 
@@ -980,7 +1414,12 @@ app.post("/workspaces/:id/join", requireAuth, (req, res) => {
     return;
   }
 
-  appendAuditLog(res.locals.authUsername, "Workspace Join Requested");
+  appendAuditLog(res.locals.authUsername, "Workspace Join Requested", {
+    actorId: res.locals.authUsername,
+    subjectId: res.locals.authUsername,
+    workspaceId: workspace.id,
+    visibility: "workspace"
+  });
   res.json({
     message: membership.status === "active" ? "Already an active workspace member" : "Workspace join request submitted",
     membership: serializeWorkspaceMember(membership)
@@ -1017,7 +1456,12 @@ app.post("/workspaces/:id/invite/rotate", requireAuth, (req, res) => {
     return;
   }
 
-  appendAuditLog(res.locals.authUsername, "Workspace Invite Rotated");
+  appendAuditLog(res.locals.authUsername, "Workspace Invite Rotated", {
+    actorId: res.locals.authUsername,
+    subjectId: res.locals.authUsername,
+    workspaceId: workspace.id,
+    visibility: "workspace"
+  });
   res.json({ message: "Workspace invite rotated", workspace: rotatedWorkspace });
 });
 
@@ -1049,7 +1493,12 @@ app.post("/workspaces/:id/members/:username/approve", requireAuth, (req, res) =>
     return;
   }
 
-  appendAuditLog(req.params.username, "Workspace Member Approved");
+  appendAuditLog(req.params.username, "Workspace Member Approved", {
+    actorId: res.locals.authUsername,
+    subjectId: req.params.username,
+    workspaceId: req.params.id,
+    visibility: "workspace"
+  });
   res.json({ message: "Workspace member approved", member: serializeWorkspaceMember(membership) });
 });
 
@@ -1086,7 +1535,12 @@ app.post("/workspaces/:id/members/:username/revoke", requireAuth, (req, res) => 
     return;
   }
 
-  appendAuditLog(req.params.username, "Workspace Member Revoked");
+  appendAuditLog(req.params.username, "Workspace Member Revoked", {
+    actorId: res.locals.authUsername,
+    subjectId: req.params.username,
+    workspaceId: req.params.id,
+    visibility: "workspace"
+  });
   res.json({ message: "Workspace member revoked" });
 });
 
@@ -1133,7 +1587,12 @@ app.post("/workspaces/:id/members/:username/role", requireAuth, (req, res) => {
     return;
   }
 
-  appendAuditLog(req.params.username, "Workspace Member Role Changed");
+  appendAuditLog(req.params.username, "Workspace Member Role Changed", {
+    actorId: res.locals.authUsername,
+    subjectId: req.params.username,
+    workspaceId: req.params.id,
+    visibility: "workspace"
+  });
   res.json({ message: "Workspace member role updated", member: serializeWorkspaceMember(membership) });
 });
 
@@ -1257,8 +1716,9 @@ app.get("/security-summary", requireAuth, (_req, res) => {
   const workspaces = listWorkspacesForUser(res.locals.authUsername);
   const preKeys = getPreKeyStatus(res.locals.authUsername);
   const sessions = listSessionRecords(res.locals.authUsername, res.locals.authSessionId);
-  const auditSummary = getAuditSummary();
+  const auditSummary = visibleAuditSummary(buildVisibleAuditView(res.locals.authUsername));
   const files = listVaultFiles(res.locals.authUsername);
+  const storage = storageQuotaSnapshot(res.locals.authUsername);
 
   res.json({
     workspaces: {
@@ -1276,7 +1736,21 @@ app.get("/security-summary", requireAuth, (_req, res) => {
     files: {
       owned: files.length,
       shared: files.reduce((total, file) => total + (file.sharedWithCount || 0), 0)
+    },
+    storage: {
+      usedBytes: storage.usedBytes,
+      quotaBytes: storage.quotaBytes,
+      availableBytes: storage.availableBytes
     }
+  });
+});
+
+app.get("/storage-summary", requireAuth, (_req, res) => {
+  const storage = storageQuotaSnapshot(res.locals.authUsername);
+  res.json({
+    usedBytes: storage.usedBytes,
+    quotaBytes: storage.quotaBytes,
+    availableBytes: storage.availableBytes
   });
 });
 
@@ -1297,6 +1771,19 @@ app.post("/vault-files", requireAuth, uploadMiddleware.single("fileBlob"), (req,
     return;
   }
 
+  const quota = storageQuotaSnapshot(res.locals.authUsername, req.file.size);
+  if (!quota.allowed) {
+    removeUploadedFile(req.file.filename);
+    appendAuditLog(res.locals.authUsername, "Vault Upload Blocked Quota");
+    res.status(413).json({
+      error: "Encrypted storage quota exceeded",
+      usedBytes: quota.usedBytes,
+      quotaBytes: quota.quotaBytes,
+      projectedBytes: quota.projectedBytes
+    });
+    return;
+  }
+
   const vaultFile: VaultFileRecord = {
     id: crypto.randomUUID(),
     filepath: req.file.filename,
@@ -1311,6 +1798,206 @@ app.post("/vault-files", requireAuth, uploadMiddleware.single("fileBlob"), (req,
   addVaultFile(res.locals.authUsername, vaultFile);
   appendAuditLog(res.locals.authUsername, "Vault File Uploaded");
   res.json({ message: "Encrypted vault file stored", file: vaultFile });
+});
+
+app.post("/vault-file-upload-sessions", requireAuth, (req, res) => {
+  cleanupExpiredVaultUploadSessions();
+
+  const {
+    encryptedMetadata,
+    metadataIv,
+    wrappedFileKey,
+    wrappedFileKeyIv,
+    expectedChunks,
+    expectedSize
+  } = req.body;
+
+  const normalizedExpectedChunks = Number(expectedChunks);
+  const normalizedExpectedSize = Number(expectedSize);
+  if (
+    !encryptedMetadata ||
+    !metadataIv ||
+    !wrappedFileKey ||
+    !wrappedFileKeyIv ||
+    !Number.isInteger(normalizedExpectedChunks) ||
+    normalizedExpectedChunks < 1 ||
+    normalizedExpectedChunks > 250000 ||
+    !Number.isInteger(normalizedExpectedSize) ||
+    normalizedExpectedSize < 1 ||
+    normalizedExpectedSize > UPLOAD_FILE_LIMIT_BYTES
+  ) {
+    res.status(400).json({ error: "Missing or invalid encrypted upload session components" });
+    return;
+  }
+
+  if (![encryptedMetadata, metadataIv, wrappedFileKey, wrappedFileKeyIv].every(isLikelyEncryptedComponent)) {
+    res.status(400).json({ error: "Invalid encrypted upload session components" });
+    return;
+  }
+
+  const quota = storageQuotaSnapshot(res.locals.authUsername, normalizedExpectedSize);
+  if (!quota.allowed) {
+    appendAuditLog(res.locals.authUsername, "Vault Upload Blocked Quota");
+    res.status(413).json({
+      error: "Encrypted storage quota exceeded",
+      usedBytes: quota.usedBytes,
+      quotaBytes: quota.quotaBytes,
+      projectedBytes: quota.projectedBytes
+    });
+    return;
+  }
+
+  const id = crypto.randomUUID();
+  const dir = path.join(VAULT_CHUNK_SESSION_DIR, id);
+  fs.mkdirSync(dir, { recursive: false });
+  const now = Date.now();
+  vaultUploadSessions.set(id, {
+    id,
+    ownerUsername: res.locals.authUsername,
+    encryptedMetadata,
+    metadataIv,
+    wrappedFileKey,
+    wrappedFileKeyIv,
+    expectedChunks: normalizedExpectedChunks,
+    expectedSize: normalizedExpectedSize,
+    receivedChunks: new Set<number>(),
+    dir,
+    createdAt: now,
+    expiresAt: now + VAULT_UPLOAD_SESSION_TTL_MS
+  });
+
+  res.json({
+    uploadSessionId: id,
+    expiresAt: now + VAULT_UPLOAD_SESSION_TTL_MS,
+    chunkLimitBytes: VAULT_CHUNK_UPLOAD_LIMIT_BYTES
+  });
+});
+
+app.get("/vault-file-upload-sessions/:id", requireAuth, (req, res) => {
+  cleanupExpiredVaultUploadSessions();
+  const session = vaultUploadSessions.get(req.params.id);
+  if (!session || session.ownerUsername !== res.locals.authUsername) {
+    res.status(404).json({ error: "Upload session not found" });
+    return;
+  }
+
+  res.json({
+    uploadSessionId: session.id,
+    expiresAt: session.expiresAt,
+    expectedChunks: session.expectedChunks,
+    receivedChunks: Array.from(session.receivedChunks).sort((a, b) => a - b),
+    expectedSize: session.expectedSize
+  });
+});
+
+app.post("/vault-file-upload-sessions/:id/chunks/:index", requireAuth, chunkUploadMiddleware.single("chunk"), (req, res) => {
+  cleanupExpiredVaultUploadSessions();
+  const session = vaultUploadSessions.get(req.params.id);
+  const index = Number(req.params.index);
+
+  if (!session || session.ownerUsername !== res.locals.authUsername) {
+    removeMulterFile(req.file);
+    res.status(404).json({ error: "Upload session not found" });
+    return;
+  }
+
+  if (!req.file || !Number.isInteger(index) || index < 0 || index >= session.expectedChunks) {
+    removeMulterFile(req.file);
+    res.status(400).json({ error: "Invalid encrypted chunk upload" });
+    return;
+  }
+
+  const targetPath = chunkPath(session, index);
+  fs.rmSync(targetPath, { force: true });
+  fs.renameSync(req.file.path, targetPath);
+  session.receivedChunks.add(index);
+
+  res.json({
+    received: session.receivedChunks.size,
+    expected: session.expectedChunks
+  });
+});
+
+app.post("/vault-file-upload-sessions/:id/complete", requireAuth, async (req, res) => {
+  cleanupExpiredVaultUploadSessions();
+  const session = vaultUploadSessions.get(req.params.id);
+  if (!session || session.ownerUsername !== res.locals.authUsername) {
+    res.status(404).json({ error: "Upload session not found" });
+    return;
+  }
+
+  if (session.receivedChunks.size !== session.expectedChunks) {
+    res.status(409).json({
+      error: "Upload session is missing encrypted chunks",
+      received: session.receivedChunks.size,
+      expected: session.expectedChunks
+    });
+    return;
+  }
+
+  for (let index = 0; index < session.expectedChunks; index += 1) {
+    if (!fs.existsSync(chunkPath(session, index))) {
+      res.status(409).json({ error: `Upload session is missing encrypted chunk ${index}` });
+      return;
+    }
+  }
+
+  const finalFilename = `${crypto.randomUUID()}.vault`;
+  const finalPath = path.join(UPLOAD_DIR, finalFilename);
+  try {
+    await assembleVaultChunks(session, finalPath);
+    const actualSize = fs.statSync(finalPath).size;
+    if (actualSize !== session.expectedSize) {
+      fs.rmSync(finalPath, { force: true });
+      res.status(400).json({ error: "Encrypted upload size mismatch" });
+      return;
+    }
+
+    const quota = storageQuotaSnapshot(res.locals.authUsername, actualSize);
+    if (!quota.allowed) {
+      fs.rmSync(finalPath, { force: true });
+      appendAuditLog(res.locals.authUsername, "Vault Upload Blocked Quota");
+      res.status(413).json({
+        error: "Encrypted storage quota exceeded",
+        usedBytes: quota.usedBytes,
+        quotaBytes: quota.quotaBytes,
+        projectedBytes: quota.projectedBytes
+      });
+      return;
+    }
+
+    const vaultFile: VaultFileRecord = {
+      id: crypto.randomUUID(),
+      filepath: finalFilename,
+      fileSize: actualSize,
+      encryptedMetadata: session.encryptedMetadata,
+      metadataIv: session.metadataIv,
+      wrappedFileKey: session.wrappedFileKey,
+      wrappedFileKeyIv: session.wrappedFileKeyIv,
+      createdAt: Date.now()
+    };
+
+    addVaultFile(res.locals.authUsername, vaultFile);
+    vaultUploadSessions.delete(session.id);
+    removePathRecursive(session.dir);
+    appendAuditLog(res.locals.authUsername, "Vault File Uploaded In Chunks");
+    res.json({ message: "Encrypted vault file stored", file: vaultFile });
+  } catch {
+    fs.rmSync(finalPath, { force: true });
+    res.status(500).json({ error: "Unable to assemble encrypted vault file" });
+  }
+});
+
+app.delete("/vault-file-upload-sessions/:id", requireAuth, (req, res) => {
+  const session = vaultUploadSessions.get(req.params.id);
+  if (!session || session.ownerUsername !== res.locals.authUsername) {
+    res.status(404).json({ error: "Upload session not found" });
+    return;
+  }
+
+  vaultUploadSessions.delete(session.id);
+  removePathRecursive(session.dir);
+  res.json({ message: "Encrypted upload session cancelled" });
 });
 
 app.patch("/vault-files/:id/metadata", requireAuth, (req, res) => {
@@ -1531,6 +2218,19 @@ app.post("/vault-files/:id/rotate", requireAuth, uploadMiddleware.single("fileBl
     replacementGrants.push(grantResult.grant);
   }
 
+  const quota = storageQuotaSnapshot(res.locals.authUsername, req.file.size, file.fileSize);
+  if (!quota.allowed) {
+    removeUploadedFile(req.file.filename);
+    appendAuditLog(res.locals.authUsername, "Vault Upload Blocked Quota");
+    res.status(413).json({
+      error: "Encrypted storage quota exceeded",
+      usedBytes: quota.usedBytes,
+      quotaBytes: quota.quotaBytes,
+      projectedBytes: quota.projectedBytes
+    });
+    return;
+  }
+
   const rotatedFile: VaultFileRecord = {
     ...file,
     filepath: req.file.filename,
@@ -1690,14 +2390,16 @@ app.post("/upload", requireAuth, uploadMiddleware.single("fileBlob"), (req, res)
 });
 
 app.get("/audit-log", requireAuth, (req, res) => {
-  res.json(getAuditLog());
+  res.json(buildVisibleAuditView(res.locals.authUsername));
 });
 
 app.get("/audit-anchor", requireAuth, (req, res) => {
-  const summary = getAuditSummary();
+  const visibleEntries = buildVisibleAuditView(res.locals.authUsername);
+  const summary = visibleAuditSummary(visibleEntries);
   const exportedAt = Date.now();
   const digestPayload = JSON.stringify([
-    "crypshare-audit-anchor-v1",
+    "crypshare-visible-audit-anchor-v1",
+    res.locals.authUsername,
     summary.blockCount,
     summary.firstHash,
     summary.latestHash,
@@ -1709,6 +2411,7 @@ app.get("/audit-anchor", requireAuth, (req, res) => {
   res.json({
     version: 1,
     exportedAt,
+    scope: "visible-user-and-admin-workspaces",
     ...summary,
     ledgerDigest
   });

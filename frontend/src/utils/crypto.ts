@@ -447,6 +447,20 @@ export function estimateChunkedEncryptedSize(fileSize: number) {
   return fileSize + Math.ceil(fileSize / FILE_CHUNK_SIZE_BYTES) * ENCRYPTED_CHUNK_OVERHEAD_BYTES;
 }
 
+export async function encryptFileChunk(fileKey: CryptoKey, file: File, offset: number): Promise<Blob> {
+  const chunk = file.slice(offset, Math.min(offset + FILE_CHUNK_SIZE_BYTES, file.size));
+  const chunkBuffer = await chunk.arrayBuffer();
+
+  const chunkIv = window.crypto.getRandomValues(new Uint8Array(12));
+  const encryptedArrayBuffer = await window.crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: chunkIv },
+    fileKey,
+    chunkBuffer
+  );
+
+  return new Blob([chunkIv, encryptedArrayBuffer]);
+}
+
 export async function encryptFileChunked(fileKey: CryptoKey, file: File): Promise<{ encryptedBlob: Blob, fileIv: string }> {
   const encryptedChunks: Blob[] = [];
   let offset = 0;
@@ -455,19 +469,7 @@ export async function encryptFileChunked(fileKey: CryptoKey, file: File): Promis
   const fileIv = bytesToHex(window.crypto.getRandomValues(new Uint8Array(12)));
 
   while (offset < file.size) {
-    const chunk = file.slice(offset, offset + FILE_CHUNK_SIZE_BYTES);
-    const chunkBuffer = await chunk.arrayBuffer();
-    
-    const chunkIv = window.crypto.getRandomValues(new Uint8Array(12));
-    const encryptedArrayBuffer = await window.crypto.subtle.encrypt(
-      { name: "AES-GCM", iv: chunkIv },
-      fileKey,
-      chunkBuffer
-    );
-    
-    // Combine chunkIv and encrypted buffer
-    encryptedChunks.push(new Blob([chunkIv, encryptedArrayBuffer]));
-    
+    encryptedChunks.push(await encryptFileChunk(fileKey, file, offset));
     offset += FILE_CHUNK_SIZE_BYTES;
   }
   

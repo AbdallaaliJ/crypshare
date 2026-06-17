@@ -9,6 +9,7 @@ export interface AuthState {
   identityPublicKeyECDSA: string;
   role: string;
   token: string;
+  csrfToken?: string;
   sessionExpiresAt: number;
 }
 

@@ -20,6 +20,10 @@ export interface AuditEntry {
   action: string;
   previousHash: string;
   hash: string;
+  actorId?: string | null;
+  subjectId?: string | null;
+  workspaceId?: string | null;
+  visibility?: string | null;
 }
 
 export interface PreKeyRecord {
@@ -183,6 +187,10 @@ interface AuditRow {
   action: string;
   previous_hash: string;
   hash: string;
+  actor_id?: string | null;
+  subject_id?: string | null;
+  workspace_id?: string | null;
+  visibility?: string | null;
 }
 
 interface VaultFileRow {
@@ -438,6 +446,22 @@ function migrate() {
     ALTER TABLE vault_files ADD COLUMN deleted_at INTEGER;
     CREATE INDEX idx_vault_files_owner_deleted_created ON vault_files(owner_username, deleted_at, created_at DESC);
   `);
+
+  runMigration(10, "scoped_audit_visibility", `
+    ALTER TABLE audit_log ADD COLUMN actor_id TEXT;
+    ALTER TABLE audit_log ADD COLUMN subject_id TEXT;
+    ALTER TABLE audit_log ADD COLUMN workspace_id TEXT;
+    ALTER TABLE audit_log ADD COLUMN visibility TEXT NOT NULL DEFAULT 'user';
+
+    UPDATE audit_log
+    SET actor_id = COALESCE(actor_id, user_id),
+        subject_id = COALESCE(subject_id, user_id)
+    WHERE actor_id IS NULL OR subject_id IS NULL;
+
+    CREATE INDEX idx_audit_log_actor ON audit_log(actor_id, timestamp);
+    CREATE INDEX idx_audit_log_subject ON audit_log(subject_id, timestamp);
+    CREATE INDEX idx_audit_log_workspace ON audit_log(workspace_id, timestamp);
+  `);
 }
 
 function mapUser(row: UserRow): UserRecord {
@@ -491,7 +515,11 @@ function mapAudit(row: AuditRow): AuditEntry {
     userId: row.user_id,
     action: row.action,
     previousHash: row.previous_hash,
-    hash: row.hash
+    hash: row.hash,
+    actorId: row.actor_id ?? row.user_id,
+    subjectId: row.subject_id ?? row.user_id,
+    workspaceId: row.workspace_id ?? null,
+    visibility: row.visibility ?? "user"
   };
 }
 
@@ -1121,6 +1149,16 @@ export function findVaultFile(ownerUsername: string, id: string, options: { incl
   return row ? mapVaultFile(row) : null;
 }
 
+export function getVaultStorageBytes(ownerUsername: string) {
+  const row = db.prepare(`
+    SELECT COALESCE(SUM(file_size), 0) AS total
+    FROM vault_files
+    WHERE owner_username = ?
+  `).get(ownerUsername) as { total: number } | undefined;
+
+  return Number(row?.total || 0);
+}
+
 export function trashVaultFile(ownerUsername: string, id: string) {
   const deletedAt = Date.now();
   const result = db.prepare(`
@@ -1328,13 +1366,51 @@ export function getLastAuditHash() {
 
 export function appendAuditEntry(entry: AuditEntry) {
   db.prepare(`
-    INSERT INTO audit_log (timestamp, user_id, action, previous_hash, hash)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(entry.timestamp, entry.userId, entry.action, entry.previousHash, entry.hash);
+    INSERT INTO audit_log (
+      timestamp,
+      user_id,
+      action,
+      previous_hash,
+      hash,
+      actor_id,
+      subject_id,
+      workspace_id,
+      visibility
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    entry.timestamp,
+    entry.userId,
+    entry.action,
+    entry.previousHash,
+    entry.hash,
+    entry.actorId || entry.userId,
+    entry.subjectId || entry.userId,
+    entry.workspaceId || null,
+    entry.visibility || "user"
+  );
 }
 
 export function getAuditLog() {
   const rows = db.prepare("SELECT * FROM audit_log ORDER BY id ASC").all() as AuditRow[];
+  return rows.map(mapAudit);
+}
+
+export function getVisibleAuditLog(username: string, adminWorkspaceIds: string[]) {
+  const workspacePlaceholders = adminWorkspaceIds.map(() => "?").join(",");
+  const workspaceClause = workspacePlaceholders
+    ? `OR (workspace_id IN (${workspacePlaceholders}) AND visibility = 'workspace')`
+    : "";
+  const rows = db.prepare(`
+    SELECT *
+    FROM audit_log
+    WHERE user_id = ?
+      OR actor_id = ?
+      OR subject_id = ?
+      ${workspaceClause}
+    ORDER BY id ASC
+  `).all(username, username, username, ...adminWorkspaceIds) as AuditRow[];
+
   return rows.map(mapAudit);
 }
 

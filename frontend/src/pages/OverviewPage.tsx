@@ -92,9 +92,9 @@ export const OverviewPage: React.FC = () => {
       to: '/dashboard/files'
     },
     {
-      label: 'Review audit activity',
+      label: 'Review visible activity',
       done: !!summary && summary.audit.blocks > 0,
-      detail: `${summary?.audit.blocks ?? 0} audit block${summary?.audit.blocks === 1 ? '' : 's'}`,
+      detail: `${summary?.audit.blocks ?? 0} visible activity entr${summary?.audit.blocks === 1 ? 'y' : 'ies'}`,
       to: '/dashboard/activity'
     }
   ];
@@ -175,9 +175,9 @@ export const OverviewPage: React.FC = () => {
             </div>
           ) : (
             <div>
-              <p className="text-sm text-slate-300 mb-4">Your core setup is ready. Review Activity periodically and keep pre-keys healthy.</p>
+              <p className="text-sm text-slate-300 mb-4">Your core setup is ready. Review Security Activity periodically and keep pre-keys healthy.</p>
               <Link to="/dashboard/activity">
-                <ActionButton className="w-full"><Activity className="w-4 h-4" /> Review Activity</ActionButton>
+                <ActionButton className="w-full"><Activity className="w-4 h-4" /> Review Security Activity</ActionButton>
               </Link>
             </div>
           )}
@@ -210,7 +210,7 @@ export const OverviewPage: React.FC = () => {
         <GlassCard className="p-5">
           <Activity className="w-5 h-5 text-cyan-400 mb-3" />
           <p className="text-2xl font-bold text-white">{summary?.audit.blocks ?? '--'}</p>
-          <p className="text-xs text-slate-500 mt-1">Audit blocks</p>
+          <p className="text-xs text-slate-500 mt-1">Visible activity</p>
         </GlassCard>
       </div>
     </div>

@@ -5,6 +5,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
+import WebSocket from "ws";
 
 let baseUrl = "";
 let server: http.Server;
@@ -21,6 +22,13 @@ function authHeaders(token?: string) {
   return headers;
 }
 
+function cookieHeaderFromSetCookie(setCookie: string) {
+  return setCookie
+    .split(/,\s*(?=[^;,]+=)/)
+    .map((cookie) => cookie.split(";")[0])
+    .join("; ");
+}
+
 function userPayload(username: string, authSecret = "correct-auth-secret") {
   return {
     username,
@@ -34,6 +42,16 @@ function userPayload(username: string, authSecret = "correct-auth-secret") {
     encryptedPrivateKeyECDSA: `${username}-encrypted-ecdsa`,
     ivECDSA: `${username}-iv-ecdsa`
   };
+}
+
+function identityFingerprint(username: string) {
+  const payload = userPayload(username);
+  return sha256Hex([
+    "crypshare-identity-v1",
+    username,
+    payload.identityPublicKeyECDH,
+    payload.identityPublicKeyECDSA
+  ].join(":"));
 }
 
 async function request(pathname: string, options: RequestInit = {}) {
@@ -69,11 +87,73 @@ async function login(username: string, authSecret = "correct-auth-secret") {
   return body.token as string;
 }
 
+function createWsInbox(socket: WebSocket) {
+  const queue: Record<string, unknown>[] = [];
+  const waiters: Array<{
+    resolve: (value: Record<string, unknown>) => void;
+    reject: (reason?: unknown) => void;
+    timer: NodeJS.Timeout;
+  }> = [];
+
+  socket.on("message", (data) => {
+    const message = JSON.parse(data.toString()) as Record<string, unknown>;
+    const waiter = waiters.shift();
+    if (waiter) {
+      clearTimeout(waiter.timer);
+      waiter.resolve(message);
+      return;
+    }
+    queue.push(message);
+  });
+
+  return {
+    next(timeoutMs = 2000) {
+      const queued = queue.shift();
+      if (queued) return Promise.resolve(queued);
+
+      return new Promise<Record<string, unknown>>((resolve, reject) => {
+        const waiter = {
+          resolve,
+          reject,
+          timer: setTimeout(() => {
+            const index = waiters.indexOf(waiter);
+            if (index >= 0) waiters.splice(index, 1);
+            reject(new Error("Timed out waiting for WebSocket message."));
+          }, timeoutMs)
+        };
+        waiters.push(waiter);
+      });
+    }
+  };
+}
+
+async function openP2PSocket(token: string) {
+  const ticket = await requestJson("/p2p/signaling-ticket", {
+    method: "POST",
+    headers: authHeaders(token)
+  });
+  assert.equal(ticket.res.status, 200);
+  const wsUrl = baseUrl.replace("http://", "ws://");
+  const socket = new WebSocket(`${wsUrl}/p2p/signaling?ticket=${encodeURIComponent(ticket.body.ticket)}`);
+  const inbox = createWsInbox(socket);
+  await new Promise<void>((resolve, reject) => {
+    socket.once("open", resolve);
+    socket.once("error", reject);
+  });
+  const ready = await inbox.next();
+  assert.equal(ready.type, "p2p-ready");
+  return { socket, next: inbox.next };
+}
+
 before(async () => {
   tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "crypshare-api-"));
   process.env.DATABASE_FILE = path.join(tempDir, "test.db");
   process.env.LEGACY_STATE_FILE = path.join(tempDir, "state.json");
   process.env.SESSION_TTL_MS = String(1000 * 60 * 60);
+  process.env.SESSION_COOKIE_ENABLED = "true";
+  process.env.SESSION_COOKIE_SECRET = "test-cookie-secret-that-is-long-enough-for-csrf";
+  process.env.SESSION_COOKIE_SECURE = "false";
+  process.env.USER_STORAGE_QUOTA_BYTES = "1000";
 
   const appModule = await import("../src/index");
   const databaseModule = await import("../src/database");
@@ -96,16 +176,24 @@ after(async () => {
 });
 
 test("API enforces auth, authorization, pre-key state, and audit integrity", async () => {
+  const root = await request("/");
+  assert.equal(root.status, 200);
+  assert.equal(root.headers.get("cache-control"), "no-store");
+  const rootBody = await root.json();
+  assert.equal(rootBody.name, "CrypShare API");
+
   const health = await request("/health");
   assert.equal(health.status, 200);
   assert.equal(health.headers.get("x-content-type-options"), "nosniff");
   assert.equal(health.headers.get("x-frame-options"), "DENY");
   assert.ok(health.headers.get("x-request-id"));
+  assert.equal(health.headers.get("cache-control"), "no-store");
 
   const uploadLimits = await requestJson("/upload-limits");
   assert.equal(uploadLimits.res.status, 200);
   assert.equal(typeof uploadLimits.body.uploadFileLimitBytes, "number");
-  assert.equal(uploadLimits.body.mode, "single-request");
+  assert.equal(typeof uploadLimits.body.vaultChunkUploadLimitBytes, "number");
+  assert.equal(uploadLimits.body.mode, "resumable-encrypted-chunks");
 
   const oversizedBody = await requestJson("/register", {
     method: "POST",
@@ -117,8 +205,17 @@ test("API enforces auth, authorization, pre-key state, and audit integrity", asy
   assert.equal(anonymousAudit.status, 401);
   const anonymousSummary = await request("/security-summary");
   assert.equal(anonymousSummary.status, 401);
+  const anonymousStorage = await request("/storage-summary");
+  assert.equal(anonymousStorage.status, 401);
+  const anonymousUploadSession = await requestJson("/vault-file-upload-sessions", {
+    method: "POST",
+    body: JSON.stringify({})
+  });
+  assert.equal(anonymousUploadSession.res.status, 401);
   const anonymousP2PIce = await request("/p2p/ice-config");
   assert.equal(anonymousP2PIce.status, 401);
+  const anonymousP2PTicket = await request("/p2p/signaling-ticket", { method: "POST" });
+  assert.equal(anonymousP2PTicket.status, 401);
   const anonymousP2PIdentity = await request("/p2p/identity/alice");
   assert.equal(anonymousP2PIdentity.status, 401);
 
@@ -143,12 +240,52 @@ test("API enforces auth, authorization, pre-key state, and audit integrity", asy
 
   let aliceToken = await login("alice");
 
+  const cookieSession = await requestJson("/sessions", {
+    method: "POST",
+    body: JSON.stringify({ username: "alice", authSecret: "correct-auth-secret" })
+  });
+  assert.equal(cookieSession.res.status, 200);
+  assert.equal(cookieSession.body.cookieSession, true);
+  assert.equal(typeof cookieSession.body.csrfToken, "string");
+  const setCookie = cookieSession.res.headers.get("set-cookie");
+  assert.ok(setCookie?.includes("__Host-crypshare_session="));
+  assert.ok(setCookie?.includes("__Host-crypshare_csrf="));
+  const cookieHeader = cookieHeaderFromSetCookie(setCookie || "");
+
+  const cookieGetSessions = await requestJson("/sessions", {
+    headers: { Cookie: cookieHeader }
+  });
+  assert.equal(cookieGetSessions.res.status, 200);
+
+  const cookiePostWithoutCsrf = await requestJson("/p2p/signaling-ticket", {
+    method: "POST",
+    headers: { Cookie: cookieHeader }
+  });
+  assert.equal(cookiePostWithoutCsrf.res.status, 403);
+
+  const cookiePostWithCsrf = await requestJson("/p2p/signaling-ticket", {
+    method: "POST",
+    headers: {
+      Cookie: cookieHeader,
+      "X-CSRF-Token": cookieSession.body.csrfToken
+    }
+  });
+  assert.equal(cookiePostWithCsrf.res.status, 200);
+
   const p2pIceConfig = await requestJson("/p2p/ice-config", {
     headers: authHeaders(aliceToken)
   });
   assert.equal(p2pIceConfig.res.status, 200);
   assert.equal(Array.isArray(p2pIceConfig.body.iceServers), true);
   assert.equal(typeof p2pIceConfig.body.turnConfigured, "boolean");
+
+  const p2pTicket = await requestJson("/p2p/signaling-ticket", {
+    method: "POST",
+    headers: authHeaders(aliceToken)
+  });
+  assert.equal(p2pTicket.res.status, 200);
+  assert.equal(typeof p2pTicket.body.ticket, "string");
+  assert.equal(typeof p2pTicket.body.expiresAt, "number");
 
   const aliceP2PIdentity = await requestJson("/p2p/identity/alice", {
     headers: authHeaders(aliceToken)
@@ -171,7 +308,7 @@ test("API enforces auth, authorization, pre-key state, and audit integrity", asy
     headers: authHeaders(aliceSecondToken)
   });
   assert.equal(aliceSessions.res.status, 200);
-  assert.equal(aliceSessions.body.sessions.length, 2);
+  assert.equal(aliceSessions.body.sessions.length, 3);
   assert.equal(aliceSessions.body.sessions.filter((session: { current: boolean }) => session.current).length, 1);
 
   const revokeOthers = await requestJson("/sessions/revoke-others", {
@@ -179,7 +316,7 @@ test("API enforces auth, authorization, pre-key state, and audit integrity", asy
     headers: authHeaders(aliceSecondToken)
   });
   assert.equal(revokeOthers.res.status, 200);
-  assert.equal(revokeOthers.body.revoked, 1);
+  assert.equal(revokeOthers.body.revoked, 2);
 
   const revokedOldToken = await request("/users", {
     headers: authHeaders(aliceToken)
@@ -212,6 +349,81 @@ test("API enforces auth, authorization, pre-key state, and audit integrity", asy
   assert.equal(vaultList.res.status, 200);
   assert.equal(vaultList.body.files.length, 1);
   assert.equal(vaultList.body.files[0].wrappedFileKey, "wrapped-file-key");
+
+  const storageAfterVaultUpload = await requestJson("/storage-summary", {
+    headers: authHeaders(aliceToken)
+  });
+  assert.equal(storageAfterVaultUpload.res.status, 200);
+  assert.equal(storageAfterVaultUpload.body.quotaBytes, 1000);
+  assert.ok(storageAfterVaultUpload.body.usedBytes > 0);
+
+  const quotaBlockedSession = await requestJson("/vault-file-upload-sessions", {
+    method: "POST",
+    headers: authHeaders(aliceToken),
+    body: JSON.stringify({
+      encryptedMetadata: "quota-meta",
+      metadataIv: "quota-iv",
+      wrappedFileKey: "quota-key",
+      wrappedFileKeyIv: "quota-key-iv",
+      expectedChunks: 1,
+      expectedSize: 2000
+    })
+  });
+  assert.equal(quotaBlockedSession.res.status, 413);
+  assert.equal(quotaBlockedSession.body.error, "Encrypted storage quota exceeded");
+
+  const chunkOne = new Blob(["encrypted-chunk-one"]);
+  const chunkTwo = new Blob(["encrypted-chunk-two"]);
+  const chunkSession = await requestJson("/vault-file-upload-sessions", {
+    method: "POST",
+    headers: authHeaders(aliceToken),
+    body: JSON.stringify({
+      encryptedMetadata: "chunked-meta",
+      metadataIv: "chunked-iv",
+      wrappedFileKey: "chunked-key",
+      wrappedFileKeyIv: "chunked-key-iv",
+      expectedChunks: 2,
+      expectedSize: chunkOne.size + chunkTwo.size
+    })
+  });
+  assert.equal(chunkSession.res.status, 200);
+  assert.equal(typeof chunkSession.body.uploadSessionId, "string");
+
+  const chunkOneForm = new FormData();
+  chunkOneForm.append("chunk", chunkOne, "0.chunk");
+  const chunkOneUpload = await request(`/vault-file-upload-sessions/${chunkSession.body.uploadSessionId}/chunks/0`, {
+    method: "POST",
+    headers: authHeaders(aliceToken),
+    body: chunkOneForm
+  });
+  assert.equal(chunkOneUpload.status, 200);
+
+  const chunkSessionStatus = await requestJson(`/vault-file-upload-sessions/${chunkSession.body.uploadSessionId}`, {
+    headers: authHeaders(aliceToken)
+  });
+  assert.equal(chunkSessionStatus.res.status, 200);
+  assert.deepEqual(chunkSessionStatus.body.receivedChunks, [0]);
+
+  const chunkTwoForm = new FormData();
+  chunkTwoForm.append("chunk", chunkTwo, "1.chunk");
+  const chunkTwoUpload = await request(`/vault-file-upload-sessions/${chunkSession.body.uploadSessionId}/chunks/1`, {
+    method: "POST",
+    headers: authHeaders(aliceToken),
+    body: chunkTwoForm
+  });
+  assert.equal(chunkTwoUpload.status, 200);
+
+  const chunkComplete = await requestJson(`/vault-file-upload-sessions/${chunkSession.body.uploadSessionId}/complete`, {
+    method: "POST",
+    headers: authHeaders(aliceToken)
+  });
+  assert.equal(chunkComplete.res.status, 200);
+
+  const chunkedDownload = await request(`/vault-files/${chunkComplete.body.file.id}/download`, {
+    headers: authHeaders(aliceToken)
+  });
+  assert.equal(chunkedDownload.status, 200);
+  assert.equal(await chunkedDownload.text(), "encrypted-chunk-oneencrypted-chunk-two");
 
   const vaultMetadataUpdate = await requestJson(`/vault-files/${vaultUploadBody.file.id}/metadata`, {
     method: "PATCH",
@@ -283,6 +495,73 @@ test("API enforces auth, authorization, pre-key state, and audit integrity", asy
   assert.equal(bobMaterial.res.status, 200);
 
   const bobToken = await login("bob");
+
+  const aliceP2P = await openP2PSocket(aliceToken);
+  const bobP2P = await openP2PSocket(bobToken);
+  try {
+    aliceP2P.socket.send(JSON.stringify({
+      type: "p2p-invite",
+      recipientUsername: "bob",
+      recipientFingerprint: identityFingerprint("bob"),
+      relayAllowed: false
+    }));
+    const createdInvite = await aliceP2P.next();
+    assert.equal(createdInvite.type, "p2p-invite-created");
+    assert.equal(createdInvite.recipientUsername, "bob");
+    assert.equal(typeof createdInvite.sessionId, "string");
+    const inviteSessionId = createdInvite.sessionId as string;
+
+    const incomingInvite = await bobP2P.next();
+    assert.equal(incomingInvite.type, "p2p-invite");
+    assert.equal(incomingInvite.sessionId, inviteSessionId);
+    assert.equal(incomingInvite.senderUsername, "alice");
+
+    const deliveryNotice = await aliceP2P.next();
+    assert.equal(deliveryNotice.type, "p2p-invite-delivery");
+    assert.equal(deliveryNotice.sessionId, inviteSessionId);
+    assert.equal(deliveryNotice.delivered, true);
+
+    bobP2P.socket.send(JSON.stringify({ type: "p2p-accept", sessionId: inviteSessionId }));
+    const acceptedNotice = await aliceP2P.next();
+    assert.equal(acceptedNotice.type, "p2p-accepted");
+    assert.equal(acceptedNotice.sessionId, inviteSessionId);
+
+    aliceP2P.socket.send(JSON.stringify({
+      type: "p2p-signal",
+      sessionId: inviteSessionId,
+      signalType: "offer",
+      payload: { type: "offer", sdp: "fake-offer" }
+    }));
+    const offerSignal = await bobP2P.next();
+    assert.equal(offerSignal.type, "p2p-signal");
+    assert.equal(offerSignal.signalType, "offer");
+    assert.equal(offerSignal.fromUsername, "alice");
+
+    bobP2P.socket.send(JSON.stringify({
+      type: "p2p-signal",
+      sessionId: inviteSessionId,
+      signalType: "answer",
+      payload: { type: "answer", sdp: "fake-answer" }
+    }));
+    const answerSignal = await aliceP2P.next();
+    assert.equal(answerSignal.type, "p2p-signal");
+    assert.equal(answerSignal.signalType, "answer");
+    assert.equal(answerSignal.fromUsername, "bob");
+
+    bobP2P.socket.send(JSON.stringify({
+      type: "p2p-signal",
+      sessionId: inviteSessionId,
+      signalType: "ice",
+      payload: { candidate: "candidate:1 1 udp 1 127.0.0.1 9 typ host", sdpMid: "0", sdpMLineIndex: 0 }
+    }));
+    const iceSignal = await aliceP2P.next();
+    assert.equal(iceSignal.type, "p2p-signal");
+    assert.equal(iceSignal.signalType, "ice");
+    assert.equal(iceSignal.fromUsername, "bob");
+  } finally {
+    aliceP2P.socket.close();
+    bobP2P.socket.close();
+  }
 
   const shortUsernameRegister = await register("aj");
   assert.equal(shortUsernameRegister.res.status, 200);
@@ -585,8 +864,10 @@ test("API enforces auth, authorization, pre-key state, and audit integrity", asy
   assert.equal(aliceSummary.res.status, 200);
   assert.equal(aliceSummary.body.workspaces.active, 1);
   assert.equal(aliceSummary.body.workspaces.pending, 0);
-  assert.equal(aliceSummary.body.files.owned, 1);
+  assert.equal(aliceSummary.body.files.owned, 2);
   assert.equal(aliceSummary.body.files.shared, 1);
+  assert.equal(aliceSummary.body.storage.quotaBytes, 1000);
+  assert.ok(aliceSummary.body.storage.usedBytes > 0);
   assert.equal(aliceSummary.body.preKeys.available, 0);
   assert.equal(aliceSummary.body.sessions.active, 1);
   assert.equal(typeof aliceSummary.body.audit.blocks, "number");
@@ -694,17 +975,32 @@ test("API enforces auth, authorization, pre-key state, and audit integrity", asy
   let expectedPreviousHash = "0".repeat(64);
   for (const entry of audit.body) {
     assert.equal(entry.previousHash, expectedPreviousHash);
-    const payload = JSON.stringify([entry.timestamp, entry.userId, entry.action]) + entry.previousHash;
+    const payload = JSON.stringify([
+      entry.timestamp,
+      entry.userId,
+      entry.action,
+      entry.actorId || entry.userId,
+      entry.subjectId || entry.userId,
+      entry.workspaceId || null,
+      entry.visibility || "user"
+    ]) + entry.previousHash;
     const computedHash = sha256Hex(payload);
     assert.equal(entry.hash, computedHash);
     expectedPreviousHash = computedHash;
   }
+
+  const cyAudit = await requestJson("/audit-log", {
+    headers: authHeaders(delegatedApprovalToken)
+  });
+  assert.equal(cyAudit.res.status, 200);
+  assert.equal(cyAudit.body.some((entry: { action: string; actorId?: string }) => entry.action === "Vault File Uploaded" && entry.actorId === "alice"), false);
 
   const anchor = await requestJson("/audit-anchor", {
     headers: authHeaders(aliceToken)
   });
   assert.equal(anchor.res.status, 200);
   assert.equal(anchor.body.version, 1);
+  assert.equal(anchor.body.scope, "visible-user-and-admin-workspaces");
   assert.equal(anchor.body.blockCount, audit.body.length);
   assert.equal(anchor.body.firstHash, audit.body[0].hash);
   assert.equal(anchor.body.latestHash, expectedPreviousHash);

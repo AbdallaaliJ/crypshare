@@ -6,6 +6,7 @@ import { ActionButton } from '../components/ui/ActionButton';
 import { apiUrl } from '../config/api';
 import { getErrorMessage } from '../utils/errors';
 import { CrypShareLogo } from '../components/brand/CrypShareLogo';
+import { authHeaders, rememberCsrfToken } from '../config/auth';
 import {
   generateSalt,
   deriveKEK,
@@ -73,7 +74,7 @@ export const RegisterPage: React.FC = () => {
       
       if (res.ok) {
         if (!json.approved) {
-          showToast('Identity submitted. Wait for an admin to approve it before login.', 'success');
+          showToast('Identity created. Sign in, then create or join a workspace.', 'success');
           navigate('/login');
           return;
         }
@@ -87,6 +88,7 @@ export const RegisterPage: React.FC = () => {
         if (!sessionRes.ok) {
           throw new Error(sessionJson.error || 'Session creation failed.');
         }
+        rememberCsrfToken(sessionJson.csrfToken);
 
         showToast('Generating pre-keys...', 'info');
         const preKeys = await generatePreKeys(kek, 100);
@@ -94,7 +96,7 @@ export const RegisterPage: React.FC = () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            Authorization: `Bearer ${sessionJson.token}`
+            ...authHeaders(sessionJson.token)
           },
           body: JSON.stringify({ username, preKeys })
         });

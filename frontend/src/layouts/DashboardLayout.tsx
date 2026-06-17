@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { Outlet, NavLink, useNavigate } from 'react-router-dom';
-import { Shield, History, LogOut, User, HardDrive, Users, Contact, UploadCloud, Building2, LockKeyhole, Search, LayoutDashboard, AlertTriangle, RadioTower, Menu, X } from 'lucide-react';
+import { History, LogOut, User, Folder, Users, Contact, UploadCloud, Building2, ShieldCheck, Search, LayoutDashboard, AlertTriangle, RadioTower, FolderKanban, Settings } from 'lucide-react';
 import { useAuth } from '../hooks/useAuth';
 import { useToast } from '../components/ui/useToast';
 import { IconButton } from '../components/ui/IconButton';
@@ -15,6 +15,7 @@ import {
 } from '../utils/prekeys';
 import { CrypShareLogo } from '../components/brand/CrypShareLogo';
 import { ThemeToggle } from '../components/theme/ThemeToggle';
+import { useP2P } from '../hooks/useP2P';
 
 interface WorkspaceSummary {
   id: string;
@@ -23,17 +24,24 @@ interface WorkspaceSummary {
   status: string;
 }
 
+export interface DashboardOutletContext {
+  workspaces: WorkspaceSummary[];
+  activeWorkspaceId: string;
+  selectedWorkspace?: WorkspaceSummary;
+}
+
 export const DashboardLayout: React.FC = () => {
   const { user, logout } = useAuth();
   const { showToast } = useToast();
+  const { socketReady, pendingInvites, unreadCount, markInviteRead, declineInvite } = useP2P();
   const navigate = useNavigate();
   const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState('');
   const [globalSearch, setGlobalSearch] = useState('');
-  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [p2pInboxOpen, setP2PInboxOpen] = useState(false);
   const selectedWorkspace = workspaces.find((workspace) => workspace.id === activeWorkspaceId);
 
-  useEffect(() => {
+  const loadShellWorkspaces = React.useCallback(() => {
     if (!user) return;
     let cancelled = false;
 
@@ -56,6 +64,13 @@ export const DashboardLayout: React.FC = () => {
       cancelled = true;
     };
   }, [user]);
+
+  useEffect(() => loadShellWorkspaces(), [loadShellWorkspaces]);
+
+  useEffect(() => {
+    window.addEventListener('crypshare.workspaces-changed', loadShellWorkspaces);
+    return () => window.removeEventListener('crypshare.workspaces-changed', loadShellWorkspaces);
+  }, [loadShellWorkspaces]);
 
   useEffect(() => {
     if (!user || !activeWorkspaceId) return;
@@ -92,11 +107,10 @@ export const DashboardLayout: React.FC = () => {
     event.preventDefault();
     const query = globalSearch.trim();
     navigate(query ? `/dashboard/files?search=${encodeURIComponent(query)}` : '/dashboard/files');
-    setSidebarOpen(false);
   };
 
   const handleLogout = async () => {
-    if (user?.token) {
+    if (user) {
       try {
         await fetch(apiUrl('/sessions/current'), {
           method: 'DELETE',
@@ -111,37 +125,37 @@ export const DashboardLayout: React.FC = () => {
     navigate('/login');
   };
 
+  const openP2PInvite = (sessionId: string) => {
+    markInviteRead(sessionId);
+    setP2PInboxOpen(false);
+    navigate('/dashboard/p2p');
+  };
+
   const navItems = [
     { to: '/dashboard/overview', icon: LayoutDashboard, label: 'Overview' },
-    { to: '/dashboard/files', icon: HardDrive, label: 'Files' },
-    { to: '/dashboard/shared', icon: Users, label: 'Shared' },
+    { to: '/dashboard/files', icon: Folder, label: 'Files' },
+    { to: '/dashboard/shared', icon: Users, label: 'Shared with Me' },
+    { to: '/dashboard/workspace-share', icon: FolderKanban, label: 'Workspace Share' },
     { to: '/dashboard/p2p', icon: RadioTower, label: 'P2P Transfer' },
     { to: '/dashboard/contacts', icon: Contact, label: 'Contacts' },
     { to: '/dashboard/activity', icon: History, label: 'Activity' },
     { to: '/dashboard/workspace-admin', icon: Building2, label: 'Workspace Admin' },
-    { to: '/dashboard/security', icon: LockKeyhole, label: 'Security' }
+    { to: '/dashboard/security', icon: ShieldCheck, label: 'Security' },
+    { to: '/dashboard/settings', icon: Settings, label: 'Settings' }
   ];
 
   const sidebar = (
     <>
-      <div className="p-5 border-b border-[var(--app-border)] flex items-center justify-between gap-3">
+      <div className="p-5 border-b border-[var(--app-border)]">
         <div>
           <CrypShareLogo markSize={38} wordmarkClassName="text-xl" />
-          <p className="mt-2 text-[10px] uppercase tracking-widest text-[var(--app-muted)] font-bold">Secure Drive</p>
+          <p className="mt-2 text-xs text-[var(--app-muted)] font-medium">Enterprise Secure Drive</p>
         </div>
-        <button
-          type="button"
-          onClick={() => setSidebarOpen(false)}
-          className="lg:hidden theme-toggle !p-2"
-          aria-label="Close navigation"
-        >
-          <X className="w-4 h-4" />
-        </button>
       </div>
 
       <nav className="flex-1 px-3 py-4 space-y-1.5">
         {navItems.map((item) => (
-          <NavLink key={item.to} to={item.to} style={{ textDecoration: 'none' }} onClick={() => setSidebarOpen(false)}>
+          <NavLink key={item.to} to={item.to} style={{ textDecoration: 'none' }}>
             {({ isActive }) => <IconButton icon={item.icon} label={item.label} active={isActive} />}
           </NavLink>
         ))}
@@ -157,7 +171,7 @@ export const DashboardLayout: React.FC = () => {
             <p className="text-[10px] text-[var(--success-color)] uppercase tracking-tighter font-bold">Identity active</p>
           </div>
         </div>
-        <button onClick={handleLogout} className="w-full flex items-center justify-center gap-2 py-3 text-xs font-bold text-[var(--app-muted)] hover:text-red-600 transition-colors uppercase tracking-widest">
+        <button onClick={handleLogout} className="w-full flex items-center justify-center gap-2 py-3 text-sm font-semibold text-[var(--app-muted)] hover:text-red-500 transition-colors cursor-pointer rounded-lg focus-visible:ring-2 focus-visible:ring-red-500/30 outline-none">
           <LogOut className="w-4 h-4" /> Lock Vault
         </button>
       </div>
@@ -166,34 +180,13 @@ export const DashboardLayout: React.FC = () => {
 
   return (
     <div className="app-shell min-h-screen flex selection:bg-cyan-200/60">
-      {sidebarOpen && (
-        <button
-          type="button"
-          className="fixed inset-0 z-30 bg-black/40 backdrop-blur-sm lg:hidden"
-          onClick={() => setSidebarOpen(false)}
-          aria-label="Close navigation overlay"
-        />
-      )}
-
-      <aside className="app-sidebar hidden w-64 border-r lg:flex flex-col fixed inset-y-0 left-0 z-40">
+      <aside className="app-sidebar hidden w-56 border-r md:flex flex-col fixed inset-y-0 left-0 z-40">
         {sidebar}
       </aside>
 
-      <aside className={`app-sidebar fixed inset-y-0 left-0 z-40 flex w-72 max-w-[86vw] flex-col border-r transition-transform duration-200 lg:hidden ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}`}>
-        {sidebar}
-      </aside>
-
-      <div className="flex-1 lg:ml-64 min-w-0">
-        <header className="app-header sticky top-0 z-30 min-h-16 border-b backdrop-blur-xl flex flex-wrap items-center gap-3 px-4 py-3 lg:flex-nowrap lg:px-8 lg:py-0 shadow-sm">
-          <button
-            type="button"
-            onClick={() => setSidebarOpen(true)}
-            className="theme-toggle !p-2 lg:hidden"
-            aria-label="Open navigation"
-          >
-            <Menu className="w-4 h-4" />
-          </button>
-          <div className="lg:hidden mr-auto">
+      <div className="flex-1 md:ml-56 min-w-0">
+        <header className="app-header sticky top-0 z-30 min-h-16 border-b backdrop-blur-xl flex flex-wrap items-center gap-3 px-4 py-3 lg:flex-nowrap lg:px-6 lg:py-0 shadow-sm">
+          <div className="md:hidden mr-auto">
             <CrypShareLogo markSize={32} compact />
           </div>
           <select
@@ -230,18 +223,82 @@ export const DashboardLayout: React.FC = () => {
           </form>
           <button
             onClick={() => navigate('/dashboard/files')}
-            className="inline-flex items-center gap-2 rounded-lg bg-[var(--brand-navy)] px-3 py-2 text-sm font-bold text-white hover:bg-[var(--brand-navy-2)] transition-colors shadow-sm sm:px-4"
+            className="inline-flex items-center gap-2 rounded-lg bg-[var(--brand-blue)] px-3 py-2 text-sm font-semibold text-white hover:bg-blue-700 transition-colors sm:px-4 cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-cyan)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--app-bg)]"
           >
             <UploadCloud className="w-4 h-4" /> <span className="hidden sm:inline">Upload</span>
           </button>
-          <div className="hidden xl:flex items-center gap-2 rounded-lg border border-[color-mix(in_srgb,var(--brand-cyan)_42%,var(--app-border))] bg-[color-mix(in_srgb,var(--brand-cyan)_14%,var(--app-surface))] px-3 py-2 text-xs text-[var(--app-text)] font-semibold">
-            <Shield className="w-4 h-4 text-[var(--brand-cyan)]" /> Fingerprint-gated sharing
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => setP2PInboxOpen((current) => !current)}
+              className="theme-toggle relative !p-2"
+              aria-label="P2P inbox"
+              title={socketReady ? 'P2P online' : 'P2P reconnecting'}
+            >
+              <RadioTower className="w-4 h-4" />
+              <span className={`absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full border border-[var(--app-header-bg)] ${socketReady ? 'bg-[var(--success-color)]' : 'bg-[var(--warning-color)]'}`} />
+              {unreadCount > 0 && (
+                <span className="absolute -right-2 -top-2 flex h-5 min-w-5 items-center justify-center rounded-full bg-[var(--danger-color)] px-1 text-[10px] font-bold text-white">
+                  {unreadCount}
+                </span>
+              )}
+            </button>
+            {p2pInboxOpen && (
+              <div className="absolute right-0 top-11 z-50 w-80 max-w-[calc(100vw-2rem)] rounded-lg border border-[var(--app-border)] bg-[var(--app-elevated)] p-3 shadow-[var(--app-shadow)]">
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-semibold text-[var(--app-text)]">P2P Inbox</p>
+                    <p className="text-xs text-[var(--app-muted)]">{socketReady ? 'Online for transfer requests' : 'Reconnecting signaling'}</p>
+                  </div>
+                  <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ${socketReady ? 'bg-green-500/10 text-[var(--success-color)]' : 'bg-amber-500/10 text-[var(--warning-color)]'}`}>
+                    {socketReady ? 'Online' : 'Offline'}
+                  </span>
+                </div>
+
+                {pendingInvites.length === 0 ? (
+                  <div className="rounded-lg border border-dashed border-[var(--app-border)] p-4 text-center">
+                    <p className="text-sm font-medium text-[var(--app-text)]">No pending P2P requests</p>
+                    <p className="mt-1 text-xs leading-5 text-[var(--app-muted)]">You can receive P2P invites while using any dashboard page.</p>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {pendingInvites.map((invite) => (
+                      <div key={invite.sessionId} className="rounded-lg border border-[var(--app-border)] bg-[var(--app-surface)] p-3">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <p className="truncate text-sm font-semibold text-[var(--app-text)]">{invite.senderUsername}</p>
+                            <p className="mt-1 text-xs text-[var(--app-muted)]">Incoming encrypted transfer request</p>
+                          </div>
+                          {invite.unread && <span className="rounded-full bg-[var(--brand-blue)] px-2 py-1 text-[10px] font-semibold text-white">New</span>}
+                        </div>
+                        <div className="mt-3 grid grid-cols-2 gap-2">
+                          <button
+                            type="button"
+                            onClick={() => declineInvite(invite.sessionId)}
+                            className="rounded-lg border border-[var(--app-border)] px-3 py-2 text-xs font-semibold text-[var(--app-muted)] hover:text-[var(--danger-color)]"
+                          >
+                            Decline
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => openP2PInvite(invite.sessionId)}
+                            className="rounded-lg bg-[var(--brand-blue)] px-3 py-2 text-xs font-semibold text-white hover:bg-blue-700"
+                          >
+                            Open P2P
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
           <ThemeToggle compact />
         </header>
 
         <main className="app-main min-h-[calc(100vh-4rem)] p-4 sm:p-6 lg:p-8">
-          <Outlet />
+          <Outlet context={{ workspaces, activeWorkspaceId, selectedWorkspace } satisfies DashboardOutletContext} />
         </main>
       </div>
     </div>

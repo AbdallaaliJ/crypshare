@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Building2, Clock, Copy, KeyRound, RefreshCw, ShieldAlert, ShieldCheck, UserPlus, UserX, Users } from 'lucide-react';
+import { Building2, CheckCircle2, Clock, Copy, KeyRound, Link2, RefreshCw, ShieldAlert, ShieldCheck, UserPlus, UserX, Users } from 'lucide-react';
 import { ActionButton } from '../components/ui/ActionButton';
 import { GlassCard } from '../components/ui/GlassCard';
 import { apiUrl } from '../config/api';
@@ -33,6 +33,15 @@ interface WorkspaceMember extends DirectoryUser {
   fingerprint?: string;
 }
 
+interface WorkspaceInvitePreview {
+  workspaceName: string;
+  workspaceId: string;
+  inviteCode: string;
+  inviterUsername: string;
+  fingerprint: string;
+  expiresAt: number | null;
+}
+
 export const WorkspaceAdminPage: React.FC = () => {
   const { user } = useAuth();
   const { showToast } = useToast();
@@ -44,6 +53,8 @@ export const WorkspaceAdminPage: React.FC = () => {
   const [joinWorkspaceId, setJoinWorkspaceId] = useState('');
   const [joinInviteCode, setJoinInviteCode] = useState('');
   const [joinPackageText, setJoinPackageText] = useState('');
+  const [joinInvitePreview, setJoinInvitePreview] = useState<WorkspaceInvitePreview | null>(null);
+  const [showManualJoin, setShowManualJoin] = useState(false);
   const [ownFingerprint, setOwnFingerprint] = useState('');
   const [action, setAction] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -56,6 +67,26 @@ export const WorkspaceAdminPage: React.FC = () => {
     ...member,
     fingerprint: await identityFingerprint(member)
   })));
+
+  const applyInviteInput = useCallback((value: string) => {
+    setJoinPackageText(value);
+    const parsed = parseWorkspaceInvitePackage(value);
+    const expiresAt = Number(parsed.expires);
+    const preview = parsed.workspaceId && parsed.inviteCode
+      ? {
+          workspaceName: parsed.workspaceName,
+          workspaceId: parsed.workspaceId,
+          inviteCode: parsed.inviteCode,
+          inviterUsername: parsed.inviterUsername,
+          fingerprint: parsed.fingerprint,
+          expiresAt: Number.isFinite(expiresAt) ? expiresAt : null
+        }
+      : null;
+
+    setJoinInvitePreview(preview);
+    if (parsed.workspaceId) setJoinWorkspaceId(parsed.workspaceId);
+    if (parsed.inviteCode) setJoinInviteCode(parsed.inviteCode);
+  }, []);
 
   const loadWorkspaceDetails = useCallback(async (workspace: Workspace | undefined) => {
     if (!user || !workspace || workspace.status !== 'active') {
@@ -115,11 +146,16 @@ export const WorkspaceAdminPage: React.FC = () => {
     }).then(setOwnFingerprint).catch(() => setOwnFingerprint(''));
   }, [user]);
 
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const parsed = parseWorkspaceInvitePackage(window.location.href);
+    if (parsed.workspaceId || parsed.inviteCode) {
+      applyInviteInput(window.location.href);
+    }
+  }, [applyInviteInput]);
+
   const handleJoinPackageChange = (value: string) => {
-    setJoinPackageText(value);
-    const parsed = parseWorkspaceInvitePackage(value);
-    if (parsed.workspaceId) setJoinWorkspaceId(parsed.workspaceId);
-    if (parsed.inviteCode) setJoinInviteCode(parsed.inviteCode);
+    applyInviteInput(value);
   };
 
   const handleCreateWorkspace = async () => {
@@ -139,6 +175,7 @@ export const WorkspaceAdminPage: React.FC = () => {
       if (!res.ok || !data.workspace) throw new Error(data.error || 'Unable to create workspace.');
       setWorkspaceName('');
       setSelectedWorkspaceId(data.workspace.id);
+      window.dispatchEvent(new Event('crypshare.workspaces-changed'));
       showToast('Workspace created.', 'success');
       await loadWorkspaces();
     } catch (err: unknown) {
@@ -163,9 +200,12 @@ export const WorkspaceAdminPage: React.FC = () => {
       });
       const data = await res.json() as { error?: string };
       if (!res.ok) throw new Error(data.error || 'Unable to request workspace access.');
+      setSelectedWorkspaceId(joinWorkspaceId.trim());
       setJoinWorkspaceId('');
       setJoinInviteCode('');
       setJoinPackageText('');
+      setJoinInvitePreview(null);
+      window.dispatchEvent(new Event('crypshare.workspaces-changed'));
       showToast('Workspace join request submitted.', 'success');
       await loadWorkspaces();
     } catch (err: unknown) {
@@ -274,7 +314,7 @@ export const WorkspaceAdminPage: React.FC = () => {
       inviterUsername: user.username,
       inviterFingerprint: ownFingerprint
     }));
-    showToast('Secure workspace invite package copied.', 'success');
+    showToast('Workspace invite URL copied.', 'success');
   };
 
   const inviteExpired = selectedWorkspace ? selectedWorkspace.inviteExpiresAt <= Date.now() : false;
@@ -283,8 +323,8 @@ export const WorkspaceAdminPage: React.FC = () => {
     <div className="max-w-6xl mx-auto animate-in fade-in slide-in-from-bottom-4 duration-500">
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-8">
         <div>
-          <h2 className="text-3xl font-bold text-white mb-2">Workspace Admin</h2>
-          <p className="text-slate-400">Approve collaboration groups without making one global server admin the gatekeeper.</p>
+          <h2 className="text-3xl font-bold text-white mb-2">Workspaces</h2>
+          <p className="text-slate-400">Create, join, and manage trusted collaboration spaces.</p>
         </div>
         <button
           onClick={loadWorkspaces}
@@ -315,33 +355,62 @@ export const WorkspaceAdminPage: React.FC = () => {
 
         <GlassCard className="p-6 space-y-4">
           <h3 className="text-white font-semibold flex items-center gap-2">
-            <UserPlus className="w-5 h-5 text-emerald-400" /> Join Workspace
+            <UserPlus className="w-5 h-5 text-emerald-400" /> Join Another Workspace
           </h3>
           <textarea
             value={joinPackageText}
             onChange={(event) => handleJoinPackageChange(event.target.value)}
-            placeholder="Paste secure workspace invite package..."
+            placeholder="Paste secure workspace invite URL..."
             className="min-h-28 w-full resize-none rounded-xl border border-white/5 bg-black/30 p-4 text-xs text-white placeholder:text-slate-600 focus:outline-none focus:border-cyan-500/50"
           />
-          <p className="text-xs text-slate-500">
-            Paste a package to fill the fields automatically, or enter the workspace ID and invite code manually.
-          </p>
-          <div className="grid md:grid-cols-2 gap-3">
-            <input
-              type="text"
-              value={joinWorkspaceId}
-              onChange={(event) => setJoinWorkspaceId(event.target.value)}
-              placeholder="Workspace ID"
-              className="w-full bg-black/20 border border-white/10 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-cyan-500/50"
-            />
-            <input
-              type="text"
-              value={joinInviteCode}
-              onChange={(event) => setJoinInviteCode(event.target.value)}
-              placeholder="Invite code"
-              className="w-full bg-black/20 border border-white/10 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-cyan-500/50"
-            />
-          </div>
+          {joinInvitePreview ? (
+            <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/10 p-4">
+              <div className="flex items-start gap-3">
+                <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-300" />
+                <div className="min-w-0">
+                  <p className="text-sm font-semibold text-white">
+                    {joinInvitePreview.workspaceName || 'Workspace invite'}
+                  </p>
+                  <p className="mt-1 text-xs text-emerald-100/80">
+                    {joinInvitePreview.inviterUsername ? `Invited by ${joinInvitePreview.inviterUsername}. ` : ''}
+                    {joinInvitePreview.expiresAt ? `Expires ${new Date(joinInvitePreview.expiresAt).toLocaleString()}.` : 'Review the invite before requesting access.'}
+                  </p>
+                  <p className="mt-2 text-xs text-emerald-100/70">
+                    Joining requests workspace approval. It does not automatically trust anyone's identity fingerprint.
+                  </p>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <p className="text-xs text-slate-500">
+              Paste a workspace invite link. You can belong to multiple workspaces and switch between them from the top bar.
+            </p>
+          )}
+          <button
+            type="button"
+            onClick={() => setShowManualJoin((current) => !current)}
+            className="inline-flex items-center gap-2 text-xs font-semibold text-cyan-300 hover:text-cyan-100"
+          >
+            <Link2 className="h-3.5 w-3.5" /> {showManualJoin ? 'Hide manual fields' : 'Use manual workspace ID/code'}
+          </button>
+          {showManualJoin && (
+            <div className="grid md:grid-cols-2 gap-3">
+              <input
+                type="text"
+                value={joinWorkspaceId}
+                onChange={(event) => setJoinWorkspaceId(event.target.value)}
+                placeholder="Workspace ID"
+                className="w-full bg-black/20 border border-white/10 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-cyan-500/50"
+              />
+              <input
+                type="text"
+                value={joinInviteCode}
+                onChange={(event) => setJoinInviteCode(event.target.value)}
+                placeholder="Invite code"
+                className="w-full bg-black/20 border border-white/10 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-cyan-500/50"
+              />
+            </div>
+          )}
           <ActionButton variant="secondary" onClick={handleJoinWorkspace} loading={action === 'join'} disabled={!joinWorkspaceId.trim() || !joinInviteCode.trim()} className="w-full">
             Request Access
           </ActionButton>
@@ -355,19 +424,45 @@ export const WorkspaceAdminPage: React.FC = () => {
           </div>
         ) : (
           <div className="space-y-6">
-            <select
-              value={selectedWorkspaceId}
-              onChange={async (event) => {
-                const workspaceId = event.target.value;
-                setSelectedWorkspaceId(workspaceId);
-                await loadWorkspaceDetails(workspaces.find((workspace) => workspace.id === workspaceId));
-              }}
-              className="w-full bg-black/20 border border-white/10 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-cyan-500/50"
-            >
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+              <div>
+                <h3 className="text-white font-semibold">Your Workspaces</h3>
+                <p className="text-xs text-slate-500">You can belong to more than one workspace. Pick one to manage or review.</p>
+              </div>
+              <select
+                value={selectedWorkspaceId}
+                onChange={async (event) => {
+                  const workspaceId = event.target.value;
+                  setSelectedWorkspaceId(workspaceId);
+                  await loadWorkspaceDetails(workspaces.find((workspace) => workspace.id === workspaceId));
+                }}
+                className="w-full bg-black/20 border border-white/10 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-cyan-500/50 lg:w-80"
+              >
+                {workspaces.map((workspace) => (
+                  <option key={workspace.id} value={workspace.id}>{workspace.name} - {workspace.status}</option>
+                ))}
+              </select>
+            </div>
+
+            <div className="flex flex-wrap gap-2">
               {workspaces.map((workspace) => (
-                <option key={workspace.id} value={workspace.id}>{workspace.name} - {workspace.role} - {workspace.status}</option>
+                <button
+                  key={workspace.id}
+                  type="button"
+                  onClick={async () => {
+                    setSelectedWorkspaceId(workspace.id);
+                    await loadWorkspaceDetails(workspace);
+                  }}
+                  className={`rounded-full border px-3 py-1.5 text-xs font-semibold transition-colors ${
+                    workspace.id === selectedWorkspaceId
+                      ? 'border-cyan-400/40 bg-cyan-400/15 text-cyan-100'
+                      : 'border-white/10 bg-white/5 text-slate-400 hover:text-white'
+                  }`}
+                >
+                  {workspace.name} · {workspace.status}
+                </button>
               ))}
-            </select>
+            </div>
 
             {selectedWorkspace && (
               <>
@@ -375,29 +470,37 @@ export const WorkspaceAdminPage: React.FC = () => {
                   <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-4">
                     <div className="min-w-0">
                       <p className="text-white font-semibold">{selectedWorkspace.name}</p>
-                      <p className="text-[10px] text-slate-300 font-mono break-all mt-2">ID: {selectedWorkspace.id}</p>
-                      <p className="text-[10px] text-slate-300 font-mono break-all">Invite code: {selectedWorkspace.inviteCode}</p>
+                      <p className="mt-1 text-xs text-cyan-100/80">
+                        {selectedWorkspace.role} · {selectedWorkspace.memberCount} member{selectedWorkspace.memberCount === 1 ? '' : 's'}
+                        {selectedWorkspace.pendingCount ? ` · ${selectedWorkspace.pendingCount} pending` : ''}
+                      </p>
                       <p className={`text-xs mt-3 flex items-center gap-2 ${inviteExpired ? 'text-red-200' : 'text-cyan-100/80'}`}>
                         <Clock className="w-3.5 h-3.5" />
                         {inviteExpired ? 'Invite expired' : `Invite expires ${new Date(selectedWorkspace.inviteExpiresAt).toLocaleString()}`}
                       </p>
-                      <p className="text-xs text-cyan-100/80 mt-3">
-                        Invite codes prove workspace access only. Admins must still verify the person's fingerprint out-of-band.
-                      </p>
+                      {canAdmin && (
+                        <details className="mt-3 text-xs text-cyan-100/80">
+                          <summary className="cursor-pointer font-semibold">Advanced invite details</summary>
+                          <p className="font-mono break-all mt-2">Workspace ID: {selectedWorkspace.id}</p>
+                          <p className="font-mono break-all">Invite code: {selectedWorkspace.inviteCode}</p>
+                        </details>
+                      )}
                     </div>
                     <div className="flex flex-col sm:flex-row gap-2 shrink-0">
-                      <ActionButton variant="secondary" onClick={handleCopyInvite} disabled={!ownFingerprint} className="text-xs">
-                        <Copy className="w-4 h-4" /> Copy Secure Invite
-                      </ActionButton>
                       {canAdmin && (
-                        <ActionButton
-                          variant="secondary"
-                          onClick={handleRotateInvite}
-                          loading={action === 'rotate-invite'}
-                          className="text-xs"
-                        >
-                          <KeyRound className="w-4 h-4" /> Rotate
-                        </ActionButton>
+                        <>
+                          <ActionButton variant="secondary" onClick={handleCopyInvite} disabled={!ownFingerprint} className="text-xs">
+                            <Copy className="w-4 h-4" /> Copy Invite
+                          </ActionButton>
+                          <ActionButton
+                            variant="secondary"
+                            onClick={handleRotateInvite}
+                            loading={action === 'rotate-invite'}
+                            className="text-xs"
+                          >
+                            <KeyRound className="w-4 h-4" /> Rotate
+                          </ActionButton>
+                        </>
                       )}
                     </div>
                   </div>

@@ -35,6 +35,7 @@ export interface ParsedWorkspaceInvitePackage {
 }
 
 const STORE_PREFIX = 'crypshare.trusted-identities';
+const PENDING_INVITE_KEY = 'crypshare.pending-invite-url';
 
 function storageKey(ownerUsername: string) {
   return `${STORE_PREFIX}.${ownerUsername}`;
@@ -80,13 +81,75 @@ export function fingerprintMatches(actualFingerprint: string, candidate: string)
   return normalizedCandidate.length >= 32 && normalizedActual.startsWith(normalizedCandidate);
 }
 
+function appOrigin() {
+  return typeof window === 'undefined' ? 'https://crypshare.local' : window.location.origin;
+}
+
+function encodeInvitePayload(params: Record<string, string | number>) {
+  const json = JSON.stringify(params);
+  const encoded = btoa(unescape(encodeURIComponent(json)));
+  return encoded.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function decodeInvitePayload(value: string) {
+  try {
+    const padded = value.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(value.length / 4) * 4, '=');
+    return JSON.parse(decodeURIComponent(escape(atob(padded)))) as Record<string, string | number>;
+  } catch {
+    return {};
+  }
+}
+
+function createInviteUrl(path: string, params: Record<string, string | number>) {
+  const url = new URL(path, appOrigin());
+  url.hash = `crypshareInvite=${encodeInvitePayload(params)}`;
+  return url.toString();
+}
+
+function parseInviteUrl(inviteText: string) {
+  const trimmed = inviteText.trim();
+  if (!trimmed) return null;
+
+  try {
+    return new URL(trimmed);
+  } catch {
+    try {
+      return new URL(trimmed, appOrigin());
+    } catch {
+      return null;
+    }
+  }
+}
+
+function getInvitePayload(url: URL | null) {
+  if (!url?.hash) return {};
+  const hashParams = new URLSearchParams(url.hash.replace(/^#/, ''));
+  return decodeInvitePayload(hashParams.get('crypshareInvite') || hashParams.get('invite') || '');
+}
+
+function getUrlParam(url: URL | null, names: string[]) {
+  if (!url) return '';
+
+  const payload = getInvitePayload(url);
+  for (const name of names) {
+    const value = payload[name];
+    if (value) return String(value).trim();
+  }
+
+  for (const name of names) {
+    const value = url.searchParams.get(name);
+    if (value) return value.trim();
+  }
+
+  return '';
+}
+
 export function createIdentityInvite(username: string, fingerprint: string) {
-  return [
-    'CrypShare identity invite',
-    `username: ${username}`,
-    `fingerprint: ${formatFingerprint(fingerprint)}`,
-    'Verify this fingerprint in CrypShare before sharing files.'
-  ].join('\n');
+  return createInviteUrl('/dashboard/contacts', {
+    inviteType: 'identity',
+    username,
+    fingerprint: normalizeFingerprint(fingerprint)
+  });
 }
 
 function extractField(inviteText: string, fieldNames: string[]) {
@@ -99,19 +162,37 @@ function extractField(inviteText: string, fieldNames: string[]) {
 }
 
 export function createWorkspaceInvitePackage(input: WorkspaceInvitePackageInput) {
-  return [
-    'CrypShare secure workspace invite',
-    `workspace: ${input.workspaceName}`,
-    `workspaceId: ${input.workspaceId}`,
-    `inviteCode: ${input.inviteCode}`,
-    `expires: ${new Date(input.inviteExpiresAt).toLocaleString()}`,
-    `inviter: ${input.inviterUsername}`,
-    `fingerprint: ${formatFingerprint(input.inviterFingerprint)}`,
-    'Invite codes prove workspace access only. Confirm the fingerprint with your friend outside CrypShare before trusting or sharing files.'
-  ].join('\n');
+  return createInviteUrl('/dashboard/workspace-admin', {
+    inviteType: 'workspace',
+    workspace: input.workspaceName,
+    workspaceId: input.workspaceId,
+    inviteCode: input.inviteCode,
+    expires: input.inviteExpiresAt,
+    inviter: input.inviterUsername,
+    fingerprint: normalizeFingerprint(input.inviterFingerprint)
+  });
 }
 
 export function parseWorkspaceInvitePackage(inviteText: string): ParsedWorkspaceInvitePackage {
+  const url = parseInviteUrl(inviteText);
+  const workspaceId = getUrlParam(url, ['workspaceId', 'workspaceid', 'wid', 'id']);
+  const inviteCode = getUrlParam(url, ['inviteCode', 'invitecode', 'code']);
+  const inviterUsername = getUrlParam(url, ['inviter', 'username', 'u']);
+  const fingerprint = getUrlParam(url, ['fingerprint', 'fp']);
+  const workspaceName = getUrlParam(url, ['workspace', 'workspaceName', 'name']);
+  const expires = getUrlParam(url, ['expires', 'expiry', 'exp']);
+
+  if (workspaceId || inviteCode || inviterUsername || fingerprint || workspaceName || expires) {
+    return {
+      workspaceName,
+      workspaceId,
+      inviteCode,
+      expires,
+      inviterUsername,
+      fingerprint: normalizeFingerprint(fingerprint)
+    };
+  }
+
   return {
     workspaceName: extractField(inviteText, ['workspace']),
     workspaceId: extractField(inviteText, ['workspaceId', 'workspace id', 'id']),
@@ -123,6 +204,17 @@ export function parseWorkspaceInvitePackage(inviteText: string): ParsedWorkspace
 }
 
 export function parseIdentityInvite(inviteText: string) {
+  const url = parseInviteUrl(inviteText);
+  const urlUsername = getUrlParam(url, ['username', 'inviter', 'u']);
+  const urlFingerprint = getUrlParam(url, ['fingerprint', 'fp']);
+
+  if (urlUsername || urlFingerprint) {
+    return {
+      username: urlUsername,
+      fingerprint: normalizeFingerprint(urlFingerprint)
+    };
+  }
+
   const workspaceInvite = parseWorkspaceInvitePackage(inviteText);
   const username = extractField(inviteText, ['username']) || workspaceInvite.inviterUsername;
   const fingerprint = workspaceInvite.fingerprint || normalizeFingerprint(inviteText);
@@ -169,4 +261,25 @@ export function forgetTrustedIdentity(ownerUsername: string, username: string) {
   const records = readTrustedIdentities(ownerUsername);
   delete records[username];
   writeTrustedIdentities(ownerUsername, records);
+}
+
+export function looksLikeInviteUrl(value: string) {
+  const workspaceInvite = parseWorkspaceInvitePackage(value);
+  const identityInvite = parseIdentityInvite(value);
+  return !!(
+    (workspaceInvite.workspaceId && workspaceInvite.inviteCode) ||
+    (identityInvite.username && identityInvite.fingerprint)
+  );
+}
+
+export function rememberPendingInviteUrl(value: string) {
+  if (typeof window === 'undefined' || !looksLikeInviteUrl(value)) return;
+  window.sessionStorage.setItem(PENDING_INVITE_KEY, value);
+}
+
+export function consumePendingInviteUrl() {
+  if (typeof window === 'undefined') return '';
+  const value = window.sessionStorage.getItem(PENDING_INVITE_KEY) || '';
+  window.sessionStorage.removeItem(PENDING_INVITE_KEY);
+  return value;
 }

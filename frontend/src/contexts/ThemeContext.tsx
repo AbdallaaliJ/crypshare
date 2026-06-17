@@ -4,9 +4,9 @@ import { ThemeContext, type ThemeMode } from './ThemeContextBase';
 const STORAGE_KEY = 'crypshare.theme';
 
 const getInitialTheme = (): ThemeMode => {
-  if (typeof window === 'undefined') return 'light';
+  if (typeof window === 'undefined') return 'dark';
   const saved = window.localStorage.getItem(STORAGE_KEY);
-  return saved === 'dark' || saved === 'light' ? saved : 'light';
+  return saved === 'dark' || saved === 'light' ? saved : 'dark';
 };
 
 export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {

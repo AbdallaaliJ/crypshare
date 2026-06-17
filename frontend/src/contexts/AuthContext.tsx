@@ -1,5 +1,6 @@
 import React, { useState, type ReactNode } from 'react';
 import { AuthContext, type AuthState } from './AuthContextBase';
+import { clearCsrfToken } from '../config/auth';
 
 export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [user, setUser] = useState<AuthState | null>(null);
@@ -10,7 +11,7 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
   const logout = () => {
     setUser(null);
-    // Real app might also clear localStorage if anything was persisted
+    clearCsrfToken();
   };
 
   const isAuthenticated = !!user;

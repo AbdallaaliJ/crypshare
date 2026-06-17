@@ -1,7 +1,8 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Copy, RefreshCw, ShieldAlert, ShieldCheck, ShieldQuestion, Trash2, UserPlus, Users } from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Copy, Download, RefreshCw, Search, ShieldAlert, ShieldCheck, ShieldQuestion, Trash2, UserPlus, Users } from 'lucide-react';
 import { ActionButton } from '../components/ui/ActionButton';
 import { GlassCard } from '../components/ui/GlassCard';
+import { StatusBadge } from '../components/ui/StatusBadge';
 import { apiUrl } from '../config/api';
 import { authHeaders } from '../config/auth';
 import { useAuth } from '../hooks/useAuth';
@@ -45,6 +46,8 @@ export const ContactsPage: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [previewing, setPreviewing] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const importRef = useRef<HTMLTextAreaElement | null>(null);
 
   const ownInvite = useMemo(() => {
     if (!user || !ownFingerprint) return '';
@@ -95,10 +98,18 @@ export const ContactsPage: React.FC = () => {
     loadDirectory();
   }, [loadDirectory]);
 
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const parsed = parseIdentityInvite(window.location.href);
+    if (parsed.username && parsed.fingerprint) {
+      setInviteText(window.location.href);
+    }
+  }, []);
+
   const handleCopyInvite = () => {
     if (!ownInvite) return;
     navigator.clipboard.writeText(ownInvite);
-    showToast('Identity invite copied.', 'success');
+    showToast('Private identity invite link copied.', 'success');
   };
 
   const handlePreviewInvite = async () => {
@@ -106,7 +117,7 @@ export const ContactsPage: React.FC = () => {
 
     const parsed = parseIdentityInvite(inviteText);
     if (!parsed.username || !parsed.fingerprint) {
-      showToast('Paste an invite with username and fingerprint.', 'error');
+      showToast('Paste a CrypShare invite link.', 'error');
       return;
     }
 
@@ -187,163 +198,243 @@ export const ContactsPage: React.FC = () => {
     showToast(`${username} removed from trusted contacts.`, 'success');
   };
 
+  const contactRows = useMemo(() => {
+    const trustedRows = Object.values(trustedContacts).map((contact) => {
+      const status = trustStatuses[contact.username];
+      return {
+        username: contact.username,
+        fingerprint: status?.fingerprint || contact.fingerprint,
+        trustedAt: contact.trustedAt,
+        status,
+        trusted: true,
+        changed: !!status?.changed
+      };
+    });
+
+    const trustedNames = new Set(trustedRows.map((contact) => contact.username));
+    const directoryRows = directory
+      .filter((identity) => !trustedNames.has(identity.username))
+      .map((identity) => ({
+        username: identity.username,
+        fingerprint: trustStatuses[identity.username]?.fingerprint || '',
+        trustedAt: 0,
+        status: trustStatuses[identity.username],
+        trusted: false,
+        changed: !!trustStatuses[identity.username]?.changed
+      }));
+
+    const normalized = searchQuery.trim().toLowerCase();
+    return [...trustedRows, ...directoryRows].filter((row) => {
+      if (!normalized) return true;
+      return `${row.username} ${row.fingerprint}`.toLowerCase().includes(normalized);
+    });
+  }, [directory, searchQuery, trustStatuses, trustedContacts]);
+
   return (
-    <div className="max-w-5xl mx-auto py-12 animate-in fade-in slide-in-from-bottom-4 duration-500">
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-8">
+    <div className="mx-auto max-w-7xl animate-in fade-in slide-in-from-bottom-4 duration-500">
+      <div className="mb-6 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
         <div>
-          <h2 className="text-3xl font-bold text-white mb-2">Contacts</h2>
-          <p className="text-slate-400">Verify identity fingerprints before sharing encrypted files.</p>
+          <h2 className="mb-2 text-3xl font-bold text-[var(--app-text)]">Contacts</h2>
+          <p className="text-sm text-[var(--app-muted)]">Manage trusted identities and fingerprint verification.</p>
         </div>
-        <button
-          onClick={loadDirectory}
-          disabled={loading}
-          className="p-3 bg-white/5 hover:bg-white/10 text-slate-300 rounded-xl border border-white/10 transition-colors disabled:opacity-50"
-          title="Refresh contacts"
-        >
-          <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <ActionButton onClick={handleCopyInvite} disabled={!ownInvite}>
+            <UserPlus className="h-4 w-4" /> Add Contact
+          </ActionButton>
+          <ActionButton
+            variant="secondary"
+            onClick={() => importRef.current?.focus()}
+          >
+            <Download className="h-4 w-4" /> Import
+          </ActionButton>
+          <button
+            onClick={loadDirectory}
+            disabled={loading}
+            className="theme-toggle !p-2"
+            title="Refresh contacts"
+          >
+            <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
+          </button>
+        </div>
       </div>
 
-      <div className="grid lg:grid-cols-2 gap-6 mb-6">
-        <GlassCard className="p-6 space-y-4">
+      <div className="mb-6 grid gap-4 lg:grid-cols-[0.9fr_1.1fr]">
+        <GlassCard className="p-5">
           <div className="flex items-start justify-between gap-4">
             <div>
-              <h3 className="text-white font-semibold">Your Identity Invite</h3>
-              <p className="text-xs text-slate-500 mt-1">Send this through a trusted channel so a friend can verify you.</p>
+              <h3 className="font-semibold text-[var(--app-text)]">Private Identity Invite</h3>
+              <p className="mt-1 text-xs text-[var(--app-muted)]">Send this through a trusted channel so a friend can verify your fingerprint.</p>
             </div>
             <ActionButton variant="secondary" onClick={handleCopyInvite} disabled={!ownInvite} className="text-xs">
-              <Copy className="w-4 h-4" /> Copy
+              <Copy className="h-4 w-4" /> Copy
             </ActionButton>
           </div>
-          <pre className="min-h-32 whitespace-pre-wrap break-all rounded-xl border border-white/5 bg-black/30 p-4 text-xs text-slate-300">
-            {ownInvite || 'Generating invite...'}
-          </pre>
+          <div className="mt-4 rounded-lg border border-[var(--app-border)] bg-[var(--app-surface-muted)] p-4">
+            <div className="flex items-center gap-2">
+              <ShieldCheck className="h-4 w-4 text-[var(--success-color)]" />
+              <p className="text-sm font-medium text-[var(--app-text)]">{ownInvite ? 'Invite link is ready' : 'Generating invite link...'}</p>
+            </div>
+            <p className="mt-2 text-xs text-[var(--app-muted)]">
+              New links use a private URL fragment. The server does not receive the invite payload in normal HTTP requests.
+            </p>
+            {ownInvite && (
+              <details className="mt-3 text-xs text-[var(--app-muted)]">
+                <summary className="cursor-pointer font-semibold text-[var(--brand-blue)]">Show private link</summary>
+                <p className="mt-2 break-all font-mono">{ownInvite}</p>
+              </details>
+            )}
+          </div>
         </GlassCard>
 
-        <GlassCard className="p-6 space-y-4">
+        <GlassCard className="p-5">
           <div>
-            <h3 className="text-white font-semibold">Verify Friend Invite</h3>
-            <p className="text-xs text-slate-500 mt-1">Paste an identity invite or secure workspace invite package.</p>
+            <h3 className="font-semibold text-[var(--app-text)]">Import And Verify</h3>
+            <p className="mt-1 text-xs text-[var(--app-muted)]">Paste a CrypShare invite link, preview the fingerprint, then verify out-of-band before trusting.</p>
           </div>
           <textarea
+            ref={importRef}
             value={inviteText}
             onChange={(event) => {
               setInviteText(event.target.value);
               setInvitePreview(null);
             }}
-            placeholder="Paste CrypShare invite..."
-            className="min-h-32 w-full resize-none rounded-xl border border-white/5 bg-black/30 p-4 text-xs text-white placeholder:text-slate-600 focus:outline-none focus:border-cyan-500/50"
+            placeholder="Paste CrypShare invite URL..."
+            className="mt-4 min-h-24 w-full resize-none rounded-lg border border-[var(--app-border)] bg-[var(--app-field)] p-4 text-xs text-[var(--app-text)] placeholder:text-[var(--app-subtle)] focus:outline-none focus:border-[var(--brand-blue)]"
           />
-          <ActionButton onClick={handlePreviewInvite} loading={previewing} disabled={!inviteText.trim()} className="w-full">
-            <ShieldQuestion className="w-4 h-4" /> Preview Verification
-          </ActionButton>
+          <div className="mt-3 flex justify-end">
+            <ActionButton onClick={handlePreviewInvite} loading={previewing} disabled={!inviteText.trim()}>
+              <ShieldQuestion className="h-4 w-4" /> Preview Verification
+            </ActionButton>
+          </div>
           {invitePreview && (
-            <div className={`rounded-xl border p-4 text-sm ${
+            <div className={`mt-4 rounded-lg border p-4 text-sm ${
               invitePreview.error
-                ? 'border-red-500/20 bg-red-500/10'
-                : 'border-emerald-500/20 bg-emerald-500/10'
+                ? 'border-[color-mix(in_srgb,var(--danger-color)_35%,var(--app-border))] bg-[color-mix(in_srgb,var(--danger-color)_10%,var(--app-surface))]'
+                : 'border-[color-mix(in_srgb,var(--success-color)_35%,var(--app-border))] bg-[color-mix(in_srgb,var(--success-color)_10%,var(--app-surface))]'
             }`}>
-              <div className="flex items-center gap-2 text-white font-semibold">
-                {invitePreview.error ? <ShieldAlert className="w-4 h-4 text-red-300" /> : <ShieldCheck className="w-4 h-4 text-emerald-300" />}
+              <div className="flex items-center gap-2 font-semibold text-[var(--app-text)]">
+                {invitePreview.error ? <ShieldAlert className="h-4 w-4 text-[var(--danger-color)]" /> : <ShieldCheck className="h-4 w-4 text-[var(--success-color)]" />}
                 {invitePreview.matches ? 'Fingerprint match' : 'Verification blocked'}
               </div>
               <div className="mt-3 space-y-2 text-xs">
-                <p className="text-slate-300">Invite username: <span className="font-mono text-white">{invitePreview.username}</span></p>
-                <p className="text-slate-400 break-all">Invite fingerprint: <span className="font-mono">{formatFingerprint(invitePreview.pastedFingerprint)}</span></p>
+                <p className="text-[var(--app-muted)]">Identity: <span className="font-mono text-[var(--app-text)]">{invitePreview.username}</span></p>
+                <p className="break-all text-[var(--app-muted)]">Invite fingerprint: <span className="font-mono">{formatFingerprint(invitePreview.pastedFingerprint)}</span></p>
                 {invitePreview.serverFingerprint && (
-                  <p className="text-slate-400 break-all">Server fingerprint: <span className="font-mono">{formatFingerprint(invitePreview.serverFingerprint)}</span></p>
+                  <p className="break-all text-[var(--app-muted)]">Published fingerprint: <span className="font-mono">{formatFingerprint(invitePreview.serverFingerprint)}</span></p>
                 )}
                 {invitePreview.error ? (
-                  <p className="text-red-200">{invitePreview.error}</p>
+                  <p className="text-[var(--danger-color)]">{invitePreview.error}</p>
                 ) : (
-                  <p className="text-emerald-100">Confirm this fingerprint with your friend outside CrypShare before trusting.</p>
+                  <p className="text-[var(--success-color)]">Confirm this fingerprint with your friend outside CrypShare before trusting.</p>
                 )}
                 {invitePreview.alreadyTrusted && (
-                  <p className="text-cyan-200">This contact is already trusted on this browser.</p>
+                  <p className="text-[var(--brand-blue)]">This contact is already trusted on this browser.</p>
                 )}
                 {invitePreview.changed && (
-                  <p className="text-red-200">A previous trusted key changed. Re-verify carefully before trusting again.</p>
+                  <p className="text-[var(--danger-color)]">A previous trusted key changed. Re-verify carefully before trusting again.</p>
                 )}
               </div>
               <ActionButton
                 onClick={handleTrustPreview}
                 loading={importing}
                 disabled={!invitePreview.matches || !invitePreview.identity}
-                className="w-full mt-4"
+                className="mt-4 w-full"
               >
-                <UserPlus className="w-4 h-4" /> Trust Contact
+                <UserPlus className="h-4 w-4" /> Mark as Trusted
               </ActionButton>
             </div>
           )}
         </GlassCard>
       </div>
 
-      <GlassCard className="p-6">
-        <div className="flex items-center gap-2 mb-4">
-          <Users className="w-5 h-5 text-cyan-400" />
-          <h3 className="text-white font-semibold">Trusted Contacts</h3>
+      <GlassCard className="overflow-hidden">
+        <div className="flex flex-col gap-4 border-b border-[var(--app-border)] p-5 md:flex-row md:items-center md:justify-between">
+          <div className="flex items-center gap-2">
+            <Users className="h-5 w-5 text-[var(--brand-blue)]" />
+            <div>
+              <h3 className="font-semibold text-[var(--app-text)]">Contacts</h3>
+              <p className="text-xs text-[var(--app-muted)]">Trust status is local to this browser.</p>
+            </div>
+          </div>
+          <div className="relative w-full md:w-80">
+            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[var(--app-muted)]" />
+            <input
+              value={searchQuery}
+              onChange={(event) => setSearchQuery(event.target.value)}
+              placeholder="Search contacts..."
+              className="w-full rounded-lg border border-[var(--app-border)] bg-[var(--app-field)] py-2 pl-10 pr-3 text-sm text-[var(--app-text)] placeholder:text-[var(--app-subtle)] focus:outline-none focus:border-[var(--brand-blue)]"
+            />
+          </div>
         </div>
-        {Object.values(trustedContacts).length === 0 ? (
-          <p className="text-sm text-slate-500">No trusted contacts yet.</p>
+        {contactRows.length === 0 ? (
+          <div className="p-12 text-center">
+            <ShieldQuestion className="mx-auto mb-3 h-10 w-10 text-[var(--app-muted)]" />
+            <p className="font-semibold text-[var(--app-text)]">No contacts found</p>
+            <p className="mt-1 text-sm text-[var(--app-muted)]">Import a private invite link to trust your first contact.</p>
+          </div>
         ) : (
-          <div className="grid gap-3">
-            {Object.values(trustedContacts).map((contact) => {
-              const status = trustStatuses[contact.username];
-              const changed = status?.changed;
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead className="border-b border-[var(--app-border)] bg-[var(--app-surface-muted)]">
+                <tr>
+                  <th className="px-5 py-3">Name</th>
+                  <th className="px-5 py-3">Trust Status</th>
+                  <th className="px-5 py-3">Fingerprint</th>
+                  <th className="px-5 py-3">Added</th>
+                  <th className="px-5 py-3 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {contactRows.map((contact) => {
+                  const changed = contact.changed;
+                  const tone = changed ? 'danger' : contact.trusted ? 'success' : 'warning';
+                  const statusLabel = changed ? 'Changed key' : contact.trusted ? 'Trusted' : 'Needs invite';
+                  const initials = contact.username.slice(0, 2).toUpperCase();
               return (
-                <div key={contact.username} className="flex flex-col md:flex-row md:items-center justify-between gap-4 rounded-xl border border-white/5 bg-black/20 p-4">
-                  <div className="min-w-0">
-                    <p className="flex items-center gap-2 text-sm font-medium text-white">
-                      {changed ? <ShieldAlert className="w-4 h-4 text-red-400" /> : <ShieldCheck className="w-4 h-4 text-emerald-400" />}
-                      {contact.username}
-                    </p>
-                    <p className="mt-1 font-mono text-xs text-slate-500 break-all">
-                      {formatFingerprint(status?.fingerprint || contact.fingerprint)}
-                    </p>
-                    {changed && (
-                      <p className="mt-2 text-xs text-red-300">Published keys changed. Re-verify with a new invite before sharing.</p>
-                    )}
-                  </div>
-                  <button
-                    onClick={() => handleForgetContact(contact.username)}
-                    className="inline-flex items-center justify-center gap-2 rounded-xl border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-200 hover:bg-red-500/20 transition-colors"
-                    title="Forget trusted contact"
-                  >
-                    <Trash2 className="w-4 h-4" /> Forget
-                  </button>
-                </div>
-              );
-            })}
+                    <tr key={contact.username} className="border-b border-[var(--app-border)] last:border-0">
+                      <td className="px-5 py-4">
+                        <div className="flex items-center gap-3">
+                          <div className="flex h-8 w-8 items-center justify-center rounded-full bg-[color-mix(in_srgb,var(--brand-blue)_16%,var(--app-surface))] text-xs font-bold text-[var(--brand-blue)]">
+                            {initials}
+                          </div>
+                          <div>
+                            <p className="font-medium text-[var(--app-text)]">{contact.username}</p>
+                            <p className="text-xs text-[var(--app-muted)]">Workspace identity</p>
+                          </div>
+                        </div>
+                      </td>
+                      <td className="px-5 py-4">
+                        <StatusBadge tone={tone}>{statusLabel}</StatusBadge>
+                      </td>
+                      <td className="px-5 py-4">
+                        <p className="max-w-[320px] truncate font-mono text-xs text-[var(--app-muted)]">
+                          {contact.fingerprint ? formatFingerprint(contact.fingerprint) : 'Awaiting invite verification'}
+                        </p>
+                      </td>
+                      <td className="px-5 py-4 text-[var(--app-muted)]">
+                        {contact.trustedAt ? new Date(contact.trustedAt).toLocaleDateString() : '—'}
+                      </td>
+                      <td className="px-5 py-4 text-right">
+                        {contact.trusted ? (
+                          <button
+                            onClick={() => handleForgetContact(contact.username)}
+                            className="inline-flex items-center justify-center gap-2 rounded-lg border border-[color-mix(in_srgb,var(--danger-color)_30%,var(--app-border))] px-3 py-2 text-xs font-medium text-[var(--danger-color)] hover:bg-[color-mix(in_srgb,var(--danger-color)_10%,var(--app-surface))] transition-colors"
+                            title="Forget trusted contact"
+                          >
+                            <Trash2 className="h-4 w-4" /> Forget
+                          </button>
+                        ) : (
+                          <StatusBadge tone={changed ? 'danger' : 'warning'}>{changed ? 'Re-verify' : 'Import invite'}</StatusBadge>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           </div>
         )}
       </GlassCard>
-
-      <div className="mt-6 grid gap-3">
-        {directory.map((identity) => {
-          const status = trustStatuses[identity.username];
-          if (status?.trusted) return null;
-          return (
-            <div key={identity.username} className="flex flex-col md:flex-row md:items-center justify-between gap-4 rounded-xl border border-white/5 bg-slate-900/40 p-4">
-              <div className="min-w-0">
-                <p className="flex items-center gap-2 text-sm font-medium text-white">
-                  {status?.changed ? <ShieldAlert className="w-4 h-4 text-red-400" /> : <ShieldQuestion className="w-4 h-4 text-amber-400" />}
-                  {identity.username}
-                </p>
-                <p className="mt-1 font-mono text-xs text-slate-500 break-all">
-                  {status ? formatFingerprint(status.fingerprint) : 'Calculating fingerprint...'}
-                </p>
-              </div>
-              <span className={`shrink-0 rounded-full border px-3 py-1 text-[10px] font-bold ${
-                status?.changed
-                  ? 'border-red-500/20 bg-red-500/10 text-red-300'
-                  : 'border-amber-500/20 bg-amber-500/10 text-amber-300'
-              }`}>
-                {status?.changed ? 'Changed' : 'Needs Invite'}
-              </span>
-            </div>
-          );
-        })}
-      </div>
     </div>
   );
 };

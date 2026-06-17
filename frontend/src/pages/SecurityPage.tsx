@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Copy, KeyRound, MonitorCheck, RefreshCw, ShieldAlert, ShieldX, Fingerprint, Database } from 'lucide-react';
+import { Copy, EyeOff, KeyRound, MonitorCheck, RefreshCw, ShieldAlert, ShieldCheck, ShieldX, Fingerprint, Database } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { ActionButton } from '../components/ui/ActionButton';
 import { GlassCard } from '../components/ui/GlassCard';
@@ -22,6 +22,7 @@ interface SessionInfo {
 interface AuditAnchor {
   version: number;
   exportedAt: number;
+  scope?: string;
   blockCount: number;
   latestHash: string | null;
   ledgerDigest: string;
@@ -161,7 +162,7 @@ export const SecurityPage: React.FC = () => {
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-8">
         <div>
           <h2 className="text-3xl font-bold text-white mb-2">Security</h2>
-          <p className="text-slate-400">Identity controls, session hygiene, pre-key health, and audit evidence.</p>
+          <p className="text-slate-400">Identity controls, session hygiene, pre-key health, and visible activity evidence.</p>
         </div>
         <button
           onClick={loadSecurityState}
@@ -182,8 +183,8 @@ export const SecurityPage: React.FC = () => {
               </h3>
               <p className="text-xs text-slate-500 mt-1">Compare this out-of-band before anyone trusts your identity.</p>
             </div>
-            <ActionButton variant="secondary" onClick={() => copyText(identityInvite, 'Identity invite')} disabled={!identityInvite} className="text-xs">
-              <Copy className="w-4 h-4" /> Invite
+            <ActionButton variant="secondary" onClick={() => copyText(identityInvite, 'Identity invite URL')} disabled={!identityInvite} className="text-xs">
+              <Copy className="w-4 h-4" /> Invite URL
             </ActionButton>
           </div>
           <p className="font-mono text-xs text-slate-300 break-all rounded-xl border border-white/5 bg-black/20 p-4">
@@ -264,13 +265,13 @@ export const SecurityPage: React.FC = () => {
         <GlassCard className="p-6 space-y-5">
           <div>
             <h3 className="text-white font-semibold flex items-center gap-2">
-              <Database className="w-5 h-5 text-cyan-400" /> Audit Evidence
+              <Database className="w-5 h-5 text-cyan-400" /> Activity Evidence
             </h3>
-            <p className="text-xs text-slate-500 mt-1">Export anchors externally to prove the audit chain later.</p>
+            <p className="text-xs text-slate-500 mt-1">Export your visible activity checkpoint without exposing other users.</p>
           </div>
           <div className="grid grid-cols-2 gap-3">
             <div className="rounded-xl border border-white/5 bg-black/20 p-4">
-              <p className="text-[10px] uppercase text-slate-500 font-bold tracking-widest">Blocks</p>
+              <p className="text-[10px] uppercase text-slate-500 font-bold tracking-widest">Entries</p>
               <p className="text-2xl font-bold text-white mt-1">{anchor?.blockCount ?? '--'}</p>
             </div>
             <div className="rounded-xl border border-white/5 bg-black/20 p-4 min-w-0">
@@ -278,8 +279,8 @@ export const SecurityPage: React.FC = () => {
               <p className="font-mono text-xs text-cyan-400 mt-2 break-all">{anchor?.ledgerDigest?.slice(0, 28) || '--'}...</p>
             </div>
           </div>
-          <ActionButton variant="secondary" onClick={() => anchor && copyText(JSON.stringify(anchor, null, 2), 'Audit anchor')} disabled={!anchor}>
-            <Copy className="w-4 h-4" /> Export Anchor
+          <ActionButton variant="secondary" onClick={() => anchor && copyText(JSON.stringify(anchor, null, 2), 'Activity checkpoint')} disabled={!anchor}>
+            <Copy className="w-4 h-4" /> Export Checkpoint
           </ActionButton>
           <div className="rounded-xl border border-red-500/20 bg-red-500/10 p-4">
             <h4 className="text-red-300 font-medium flex items-center gap-2">
@@ -297,6 +298,43 @@ export const SecurityPage: React.FC = () => {
           </div>
         </GlassCard>
       </div>
+
+      <GlassCard className="mt-6 p-6">
+        <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
+          <div className="max-w-2xl">
+            <h3 className="text-white font-semibold flex items-center gap-2">
+              <EyeOff className="w-5 h-5 text-cyan-400" /> Privacy Boundary
+            </h3>
+            <p className="text-xs text-slate-500 mt-2">
+              CrypShare is designed for small trusted workspaces. It encrypts file contents and labels in the browser, but it is honest about the metadata needed to run the service.
+            </p>
+          </div>
+          <span className="inline-flex items-center gap-2 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-xs font-semibold text-emerald-300">
+            <ShieldCheck className="w-3.5 h-3.5" /> Public-beta privacy model
+          </span>
+        </div>
+
+        <div className="mt-5 grid gap-4 lg:grid-cols-3">
+          <div className="rounded-xl border border-white/5 bg-black/20 p-4">
+            <h4 className="text-sm font-semibold text-emerald-300">Protected from the server</h4>
+            <p className="mt-2 text-xs leading-relaxed text-slate-400">
+              File contents, file names, folder names, shared file labels, private identity keys, and P2P file metadata are encrypted before leaving the browser.
+            </p>
+          </div>
+          <div className="rounded-xl border border-white/5 bg-black/20 p-4">
+            <h4 className="text-sm font-semibold text-amber-300">Visible service metadata</h4>
+            <p className="mt-2 text-xs leading-relaxed text-slate-400">
+              The server still sees usernames, workspace membership, encrypted blob sizes, timestamps, session records, grant routing, and security activity events.
+            </p>
+          </div>
+          <div className="rounded-xl border border-white/5 bg-black/20 p-4">
+            <h4 className="text-sm font-semibold text-cyan-300">Your trust duties</h4>
+            <p className="mt-2 text-xs leading-relaxed text-slate-400">
+              Verify fingerprints outside CrypShare, rotate leaked workspace invites, keep pre-keys healthy, and revoke sessions or identities when a device is lost.
+            </p>
+          </div>
+        </div>
+      </GlassCard>
     </div>
   );
 };

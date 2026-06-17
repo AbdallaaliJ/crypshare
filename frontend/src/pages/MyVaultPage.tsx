@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { Activity, Download, File as FileIcon, Folder, FolderPlus, Lock, RefreshCw, RotateCcw, Save, Search, Share2, Trash2, UploadCloud, UserMinus, ShieldCheck, ShieldQuestion, ShieldAlert, X, Info } from 'lucide-react';
+import { Activity, Download, File as FileIcon, Folder, FolderPlus, HardDrive, Lock, RefreshCw, RotateCcw, Save, Search, Share2, Trash2, UploadCloud, UserMinus, ShieldCheck, ShieldQuestion, ShieldAlert, X, Info } from 'lucide-react';
 import { ActionButton } from '../components/ui/ActionButton';
 import { GlassCard } from '../components/ui/GlassCard';
 import { apiUrl } from '../config/api';
@@ -20,15 +20,18 @@ import {
   decryptFileChunked,
   decryptFileData,
   encryptFileKeyWithX3DH,
+  encryptFileChunk,
   encryptFileChunked,
   encryptFileData,
   estimateChunkedEncryptedSize,
+  FILE_CHUNK_SIZE_BYTES,
   generateFileKey,
   signPayload,
   unwrapFileKeyForOwner,
   wrapFileKeyForOwner
 } from '../utils/crypto';
 import { DEFAULT_UPLOAD_FILE_LIMIT_BYTES, fetchUploadLimits, formatBytes } from '../utils/uploadLimits';
+import { useUserPreferences } from '../utils/preferences';
 import type { DirectoryUser } from '../types/api';
 
 interface VaultFileRecord {
@@ -85,8 +88,15 @@ interface ShareReadiness {
   error?: string;
 }
 
+interface StorageSummary {
+  usedBytes: number;
+  quotaBytes: number;
+  availableBytes: number;
+}
+
 const ALL_FOLDERS = '__all__';
 const ROOT_FOLDER = 'Vault';
+const CHUNK_UPLOAD_RETRIES = 3;
 
 function normalizeFolderName(value: string) {
   const normalized = value.trim().replace(/\s+/g, ' ');
@@ -97,20 +107,27 @@ function getFolderName(metadata: VaultMetadata | null) {
   return normalizeFolderName(metadata?.folder || ROOT_FOLDER);
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export const MyVaultPage: React.FC = () => {
   const { user } = useAuth();
   const { showToast } = useToast();
+  const { preferences } = useUserPreferences();
   const [searchParams] = useSearchParams();
   const [files, setFiles] = useState<VaultFileView[]>([]);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [uploadLimitBytes, setUploadLimitBytes] = useState(DEFAULT_UPLOAD_FILE_LIMIT_BYTES);
   const [uploadLimitNote, setUploadLimitNote] = useState('');
+  const [storageSummary, setStorageSummary] = useState<StorageSummary | null>(null);
   const [uploadFolder, setUploadFolder] = useState(ROOT_FOLDER);
   const [activeFolder, setActiveFolder] = useState(ALL_FOLDERS);
   const [showTrash, setShowTrash] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
   const [users, setUsers] = useState<DirectoryUser[]>([]);
   const [shareTargets, setShareTargets] = useState<Record<string, string>>({});
   const [grantsByFile, setGrantsByFile] = useState<Record<string, VaultGrantRecord[]>>({});
@@ -166,6 +183,23 @@ export const MyVaultPage: React.FC = () => {
     return data.grants;
   }, [user]);
 
+  const loadStorageSummary = useCallback(async () => {
+    if (!user) return;
+
+    try {
+      const res = await fetch(apiUrl('/storage-summary'), { headers: authHeaders(user.token) });
+      const data = await res.json() as StorageSummary & { error?: string };
+      if (!res.ok) throw new Error(data.error || 'Unable to load storage summary.');
+      setStorageSummary({
+        usedBytes: Number(data.usedBytes || 0),
+        quotaBytes: Number(data.quotaBytes || 0),
+        availableBytes: Number(data.availableBytes || 0)
+      });
+    } catch {
+      setStorageSummary(null);
+    }
+  }, [user]);
+
   const loadVaultFiles = useCallback(async () => {
     if (!user) return;
 
@@ -183,12 +217,13 @@ export const MyVaultPage: React.FC = () => {
         const grantEntries = await Promise.all(data.files.map(async (file) => [file.id, await fetchVaultGrants(file.id)] as const));
         setGrantsByFile(Object.fromEntries(grantEntries));
       }
+      await loadStorageSummary();
     } catch (err: unknown) {
       showToast(getErrorMessage(err, 'Unable to load vault files.'), 'error');
     } finally {
       setLoading(false);
     }
-  }, [decryptVaultRecord, fetchVaultGrants, showToast, showTrash, user]);
+  }, [decryptVaultRecord, fetchVaultGrants, loadStorageSummary, showToast, showTrash, user]);
 
   useEffect(() => {
     loadVaultFiles();
@@ -263,20 +298,32 @@ export const MyVaultPage: React.FC = () => {
       showToast('Select a file first.', 'error');
       return;
     }
+    if (selectedFile.size <= 0) {
+      showToast('Empty files are not supported yet.', 'error');
+      return;
+    }
 
     const estimatedEncryptedSize = estimateChunkedEncryptedSize(selectedFile.size);
     if (estimatedEncryptedSize > uploadLimitBytes) {
       showToast(
-        `This file is ${formatBytes(selectedFile.size)} before encryption and about ${formatBytes(estimatedEncryptedSize)} after encryption. Current single-upload limit is ${formatBytes(uploadLimitBytes)}.`,
+        `This file is ${formatBytes(selectedFile.size)} before encryption and about ${formatBytes(estimatedEncryptedSize)} after encryption. Current encrypted upload limit is ${formatBytes(uploadLimitBytes)}.`,
+        'error'
+      );
+      return;
+    }
+    if (storageSummary?.quotaBytes && estimatedEncryptedSize > storageSummary.availableBytes) {
+      showToast(
+        `This upload needs about ${formatBytes(estimatedEncryptedSize)}, but your available encrypted storage is ${formatBytes(storageSummary.availableBytes)}.`,
         'error'
       );
       return;
     }
 
     setUploading(true);
+    setUploadProgress(0);
+    let uploadSessionId = '';
     try {
       const fileKey = await generateFileKey();
-      const { encryptedBlob } = await encryptFileChunked(fileKey, selectedFile);
       const metadata: VaultMetadata = {
         name: selectedFile.name,
         type: selectedFile.type || 'application/octet-stream',
@@ -287,29 +334,81 @@ export const MyVaultPage: React.FC = () => {
       const encryptedMetadata = await encryptFileData(fileKey, JSON.stringify(metadata));
       const wrapped = await wrapFileKeyForOwner(user.kek, fileKey);
 
-      const formData = new FormData();
-      formData.append('encryptedMetadata', encryptedMetadata.ciphertext);
-      formData.append('metadataIv', encryptedMetadata.iv);
-      formData.append('wrappedFileKey', wrapped.wrappedFileKey);
-      formData.append('wrappedFileKeyIv', wrapped.wrappedFileKeyIv);
-      formData.append('fileBlob', encryptedBlob, `${selectedFile.name}.vault`);
-
-      const res = await fetch(apiUrl('/vault-files'), {
+      const expectedChunks = Math.ceil(selectedFile.size / FILE_CHUNK_SIZE_BYTES);
+      const sessionRes = await fetch(apiUrl('/vault-file-upload-sessions'), {
         method: 'POST',
-        headers: authHeaders(user.token),
-        body: formData
+        headers: {
+          ...authHeaders(user.token),
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          encryptedMetadata: encryptedMetadata.ciphertext,
+          metadataIv: encryptedMetadata.iv,
+          wrappedFileKey: wrapped.wrappedFileKey,
+          wrappedFileKeyIv: wrapped.wrappedFileKeyIv,
+          expectedChunks,
+          expectedSize: estimatedEncryptedSize
+        })
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Unable to upload encrypted file.');
+      const sessionData = await sessionRes.json() as { uploadSessionId?: string; error?: string };
+      if (!sessionRes.ok || !sessionData.uploadSessionId) {
+        throw new Error(sessionData.error || 'Unable to start encrypted upload session.');
+      }
+      uploadSessionId = sessionData.uploadSessionId;
+
+      for (let index = 0; index < expectedChunks; index += 1) {
+        const offset = index * FILE_CHUNK_SIZE_BYTES;
+        const encryptedChunk = await encryptFileChunk(fileKey, selectedFile, offset);
+        let uploaded = false;
+        let lastError = '';
+
+        for (let attempt = 1; attempt <= CHUNK_UPLOAD_RETRIES; attempt += 1) {
+          const formData = new FormData();
+          formData.append('chunk', encryptedChunk, `${index}.chunk`);
+
+          try {
+            const chunkRes = await fetch(apiUrl(`/vault-file-upload-sessions/${uploadSessionId}/chunks/${index}`), {
+              method: 'POST',
+              headers: authHeaders(user.token),
+              body: formData
+            });
+            const chunkData = await chunkRes.json() as { error?: string };
+            if (!chunkRes.ok) throw new Error(chunkData.error || `Unable to upload encrypted chunk ${index + 1}.`);
+            uploaded = true;
+            break;
+          } catch (err: unknown) {
+            lastError = getErrorMessage(err, `Unable to upload encrypted chunk ${index + 1}.`);
+            if (attempt < CHUNK_UPLOAD_RETRIES) await sleep(300 * attempt);
+          }
+        }
+
+        if (!uploaded) throw new Error(lastError || `Unable to upload encrypted chunk ${index + 1}.`);
+        setUploadProgress(Math.round(((index + 1) / expectedChunks) * 100));
+      }
+
+      const completeRes = await fetch(apiUrl(`/vault-file-upload-sessions/${uploadSessionId}/complete`), {
+        method: 'POST',
+        headers: authHeaders(user.token)
+      });
+      const completeData = await completeRes.json() as { error?: string };
+      if (!completeRes.ok) throw new Error(completeData.error || 'Unable to finalize encrypted upload.');
+      uploadSessionId = '';
 
       showToast('Encrypted file stored in your vault.', 'success');
       setSelectedFile(null);
       setActiveFolder(metadata.folder || ROOT_FOLDER);
       await loadVaultFiles();
     } catch (err: unknown) {
+      if (uploadSessionId) {
+        fetch(apiUrl(`/vault-file-upload-sessions/${uploadSessionId}`), {
+          method: 'DELETE',
+          headers: authHeaders(user.token)
+        }).catch(() => undefined);
+      }
       showToast(getErrorMessage(err, 'Unable to upload encrypted file.'), 'error');
     } finally {
       setUploading(false);
+      setUploadProgress(0);
     }
   };
 
@@ -342,8 +441,10 @@ export const MyVaultPage: React.FC = () => {
 
   const handleDelete = async (file: VaultFileView) => {
     if (!user) return;
-    const confirmed = window.confirm(`Move "${file.metadata?.name || 'vault file'}" to Trash?`);
-    if (!confirmed) return;
+    if (preferences.confirmDestructiveActions) {
+      const confirmed = window.confirm(`Move "${file.metadata?.name || 'vault file'}" to Trash?`);
+      if (!confirmed) return;
+    }
 
     setActiveFileId(file.id);
     try {
@@ -388,8 +489,10 @@ export const MyVaultPage: React.FC = () => {
 
   const handlePermanentDelete = async (file: VaultFileView) => {
     if (!user) return;
-    const confirmed = window.confirm(`Permanently delete "${file.metadata?.name || 'vault file'}"? This cannot be undone.`);
-    if (!confirmed) return;
+    if (preferences.confirmDestructiveActions) {
+      const confirmed = window.confirm(`Permanently delete "${file.metadata?.name || 'vault file'}"? This cannot be undone.`);
+      if (!confirmed) return;
+    }
 
     setActiveFileId(file.id);
     try {
@@ -402,6 +505,7 @@ export const MyVaultPage: React.FC = () => {
 
       setFiles((current) => current.filter((item) => item.id !== file.id));
       setDetailFileId(null);
+      await loadStorageSummary();
       showToast('Vault file permanently deleted.', 'success');
     } catch (err: unknown) {
       showToast(getErrorMessage(err, 'Unable to permanently delete vault file.'), 'error');
@@ -549,8 +653,10 @@ export const MyVaultPage: React.FC = () => {
   const handleRevokeGrant = async (file: VaultFileView, grant: VaultGrantRecord) => {
     if (!user?.kek) return;
 
-    const confirmed = window.confirm(`Revoke ${grant.recipientUsername}'s access and rotate the file key?`);
-    if (!confirmed) return;
+    if (preferences.confirmDestructiveActions) {
+      const confirmed = window.confirm(`Revoke ${grant.recipientUsername}'s access and rotate the file key?`);
+      if (!confirmed) return;
+    }
 
     setActiveFileId(file.id);
     try {
@@ -709,6 +815,15 @@ export const MyVaultPage: React.FC = () => {
   );
   const selectedEncryptedSizeEstimate = selectedFile ? estimateChunkedEncryptedSize(selectedFile.size) : 0;
   const selectedFileTooLarge = selectedFile ? selectedEncryptedSizeEstimate > uploadLimitBytes : false;
+  const storageQuotaEnabled = !!storageSummary && storageSummary.quotaBytes > 0;
+  const storageUsagePercent = storageQuotaEnabled
+    ? Math.min(100, Math.round((storageSummary.usedBytes / storageSummary.quotaBytes) * 100))
+    : 0;
+  const selectedFileExceedsQuota = !!selectedFile && storageQuotaEnabled && selectedEncryptedSizeEstimate > storageSummary.availableBytes;
+  const uploadDisabled = !selectedFile || selectedFileTooLarge || selectedFileExceedsQuota || loading;
+  const tableHeaderClass = preferences.denseFileTables ? 'px-5 py-3 font-bold' : 'px-5 py-4 font-bold';
+  const tableCellClass = preferences.denseFileTables ? 'px-5 py-2.5' : 'px-5 py-4';
+  const fileIconClass = preferences.denseFileTables ? 'w-8 h-8' : 'w-9 h-9';
 
   return (
     <div className="max-w-7xl mx-auto animate-in fade-in slide-in-from-bottom-4 duration-500">
@@ -767,8 +882,16 @@ export const MyVaultPage: React.FC = () => {
                 </p>
                 {selectedFileTooLarge && (
                   <p className="text-xs text-red-300 mt-1">
-                    Current single-upload limit is {formatBytes(uploadLimitBytes)}. Use a smaller file or raise the backend limit for this deployment.
+                    Current encrypted upload limit is {formatBytes(uploadLimitBytes)}. Larger deployments need object storage and quota policy.
                   </p>
+                )}
+                {uploading && (
+                  <div className="mt-3 h-2 w-full overflow-hidden rounded-full bg-slate-800">
+                    <div
+                      className="h-full rounded-full bg-cyan-400 transition-all"
+                      style={{ width: `${uploadProgress}%` }}
+                    />
+                  </div>
                 )}
               </div>
             </div>
@@ -783,12 +906,38 @@ export const MyVaultPage: React.FC = () => {
               className="w-full bg-black/30 border border-white/10 rounded-xl py-3 pl-10 pr-4 text-sm text-white placeholder:text-slate-600 focus:outline-none focus:border-cyan-500/50 disabled:opacity-50"
             />
           </div>
-          <ActionButton onClick={handleUpload} loading={uploading} disabled={!selectedFile || selectedFileTooLarge || loading}>
-            <Lock className="w-4 h-4" /> Upload
+          <ActionButton onClick={handleUpload} loading={uploading} disabled={uploadDisabled}>
+            <Lock className="w-4 h-4" /> {uploading ? `${uploadProgress}%` : 'Upload'}
           </ActionButton>
         </div>
-        {uploadLimitNote && (
+        {preferences.securityHints && uploadLimitNote && (
           <p className="mt-3 text-xs text-slate-500">{uploadLimitNote}</p>
+        )}
+        {storageSummary && (
+          <div className="mt-4 rounded-xl border border-white/10 bg-black/20 p-4">
+            <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+              <div className="flex items-center gap-2 text-sm text-slate-300">
+                <HardDrive className="h-4 w-4 text-cyan-400" />
+                <span>
+                  {formatBytes(storageSummary.usedBytes)} used
+                  {storageQuotaEnabled ? ` of ${formatBytes(storageSummary.quotaBytes)}` : ' · quota disabled'}
+                </span>
+              </div>
+              {selectedFileExceedsQuota && (
+                <span className="text-xs text-red-300">
+                  Selected file exceeds available encrypted storage.
+                </span>
+              )}
+            </div>
+            {storageQuotaEnabled && (
+              <div className="mt-3 h-2 overflow-hidden rounded-full bg-slate-800">
+                <div
+                  className={`h-full rounded-full transition-all ${storageUsagePercent > 90 ? 'bg-red-400' : storageUsagePercent > 75 ? 'bg-amber-400' : 'bg-cyan-400'}`}
+                  style={{ width: `${storageUsagePercent}%` }}
+                />
+              </div>
+            )}
+          </div>
         )}
       </GlassCard>
 
@@ -861,12 +1010,12 @@ export const MyVaultPage: React.FC = () => {
             <table className="w-full text-left">
               <thead>
                 <tr className="border-b border-white/5 text-[10px] uppercase tracking-widest text-slate-500">
-                  <th className="px-5 py-4 font-bold">Name</th>
-                  <th className="px-5 py-4 font-bold">Folder</th>
-                  <th className="px-5 py-4 font-bold">Size</th>
-                  <th className="px-5 py-4 font-bold">{showTrash ? 'Deleted' : 'Created'}</th>
-                  <th className="px-5 py-4 font-bold">Shared</th>
-                  <th className="px-5 py-4 font-bold text-right">Actions</th>
+                  <th className={tableHeaderClass}>Name</th>
+                  <th className={tableHeaderClass}>Folder</th>
+                  <th className={tableHeaderClass}>Size</th>
+                  <th className={tableHeaderClass}>{showTrash ? 'Deleted' : 'Created'}</th>
+                  <th className={tableHeaderClass}>Shared</th>
+                  <th className={`${tableHeaderClass} text-right`}>Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-white/5">
@@ -874,30 +1023,30 @@ export const MyVaultPage: React.FC = () => {
                   const grants = grantsByFile[file.id] || [];
                   return (
                     <tr key={file.id} className="hover:bg-white/[0.03] transition-colors">
-                      <td className="px-5 py-4">
+                      <td className={tableCellClass}>
                         <div className="flex items-center gap-3 min-w-0">
-                          <div className="w-9 h-9 rounded-lg bg-white/5 flex items-center justify-center shrink-0">
+                          <div className={`${fileIconClass} rounded-lg bg-white/5 flex items-center justify-center shrink-0`}>
                             <FileIcon className="w-5 h-5 text-slate-400" />
                           </div>
                           <div className="min-w-0">
                             <p className="text-sm text-white font-medium truncate">{file.metadata?.name || 'Encrypted metadata unavailable'}</p>
-                            <p className="text-[10px] text-slate-500">Encrypted metadata · owner-only key wrap</p>
+                            {preferences.securityHints && <p className="text-[10px] text-slate-500">Encrypted metadata · owner-only key wrap</p>}
                           </div>
                         </div>
                       </td>
-                      <td className="px-5 py-4 text-sm text-slate-300">{getFolderName(file.metadata)}</td>
-                      <td className="px-5 py-4 text-sm text-slate-400">{formatBytes(file.metadata?.size || file.fileSize)}</td>
-                      <td className="px-5 py-4 text-sm text-slate-400 whitespace-nowrap">
+                      <td className={`${tableCellClass} text-sm text-slate-300`}>{getFolderName(file.metadata)}</td>
+                      <td className={`${tableCellClass} text-sm text-slate-400`}>{formatBytes(file.metadata?.size || file.fileSize)}</td>
+                      <td className={`${tableCellClass} text-sm text-slate-400 whitespace-nowrap`}>
                         {new Date((showTrash && file.deletedAt) ? file.deletedAt : file.createdAt).toLocaleDateString()}
                       </td>
-                      <td className="px-5 py-4">
+                      <td className={tableCellClass}>
                         <span className={`rounded-full border px-2.5 py-1 text-[10px] font-bold ${
                           grants.length > 0 ? 'border-cyan-500/20 bg-cyan-500/10 text-cyan-300' : 'border-white/10 bg-white/5 text-slate-500'
                         }`}>
                           {grants.length || file.sharedWithCount || 0} users
                         </span>
                       </td>
-                      <td className="px-5 py-4">
+                      <td className={tableCellClass}>
                         <div className="flex justify-end gap-2">
                           <button
                             onClick={() => setDetailFileId(file.id)}
@@ -949,9 +1098,11 @@ export const MyVaultPage: React.FC = () => {
                   <h4 className="text-white font-semibold flex items-center gap-2">
                     <FileIcon className="w-4 h-4 text-cyan-400" /> File Details
                   </h4>
-                  <p className="text-xs text-slate-500">
-                    Name and folder are re-encrypted in your browser before they are saved.
-                  </p>
+                  {preferences.securityHints && (
+                    <p className="text-xs text-slate-500">
+                      Name and folder are re-encrypted in your browser before they are saved.
+                    </p>
+                  )}
                   <label className="block">
                     <span className="text-[10px] uppercase tracking-widest text-slate-500 font-bold">Name</span>
                     <input
@@ -997,9 +1148,11 @@ export const MyVaultPage: React.FC = () => {
                   <p className="text-sm text-slate-500">No approved workspace members are available. Invite and approve members in Workspace Admin first.</p>
                 ) : (
                   <>
-                    <p className="text-xs text-slate-500">
-                      Sharing requires all three checks: an approved shared workspace, a trusted fingerprint, and available recipient pre-keys.
-                    </p>
+                    {preferences.securityHints && (
+                      <p className="text-xs text-slate-500">
+                        Sharing requires all three checks: an approved shared workspace, a trusted fingerprint, and available recipient pre-keys.
+                      </p>
+                    )}
                     <select
                       value={shareTargets[detailFile.id] || ''}
                       onChange={(event) => {

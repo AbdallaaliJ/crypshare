@@ -9,6 +9,8 @@ import { getErrorMessage } from '../utils/errors';
 import { hexToBytes, deriveKEK, deriveAuthSecret, unwrapPrivateKey } from '../utils/crypto';
 import { ActionButton } from '../components/ui/ActionButton';
 import { CrypShareLogo } from '../components/brand/CrypShareLogo';
+import { consumePendingInviteUrl } from '../utils/trust';
+import { authHeaders, rememberCsrfToken } from '../config/auth';
 
 export const LoginPage: React.FC = () => {
   const [username, setUsername] = useState('');
@@ -49,8 +51,9 @@ export const LoginPage: React.FC = () => {
       if (!sessionRes.ok) {
         throw new Error(sessionData.error || 'Invalid credentials');
       }
+      rememberCsrfToken(sessionData.csrfToken);
 
-      const authHeader = { Authorization: `Bearer ${sessionData.token}` };
+      const authHeader = authHeaders(sessionData.token);
       const identRes = await fetch(apiUrl(`/identity/${username}`), { headers: authHeader });
       const identData = await identRes.json();
       if (!identRes.ok) {
@@ -76,12 +79,23 @@ export const LoginPage: React.FC = () => {
         identityPublicKeyECDH: userInfo.identityPublicKeyECDH,
         identityPublicKeyECDSA: userInfo.identityPublicKeyECDSA,
         role: identData.role || 'member',
-        token: sessionData.token,
+        token: sessionData.token || '',
+        csrfToken: sessionData.csrfToken,
         sessionExpiresAt: sessionData.expiresAt
       });
 
       showToast('Vault unlocked. Keys in RAM.', 'success');
-      navigate('/dashboard/overview');
+      const pendingInviteUrl = consumePendingInviteUrl();
+      if (pendingInviteUrl) {
+        try {
+          const pendingInvite = new URL(pendingInviteUrl);
+          navigate(`${pendingInvite.pathname}${pendingInvite.search}`, { replace: true });
+        } catch {
+          navigate('/dashboard/overview');
+        }
+      } else {
+        navigate('/dashboard/overview');
+      }
 
     } catch (err: unknown) {
       console.error(err);

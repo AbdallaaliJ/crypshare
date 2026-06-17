@@ -23,19 +23,21 @@ export const LandingPage: React.FC = () => {
           <div className="flex flex-col sm:flex-row gap-3 items-start mb-12">
             <Link 
               to="/register" 
-              className="w-full sm:w-auto px-7 py-3 bg-[var(--brand-navy)] hover:bg-[var(--brand-navy-2)] text-white rounded-lg font-bold transition-all active:scale-[0.98] shadow-sm text-center text-sm"
+              className="w-full sm:w-auto px-7 py-3 bg-[var(--brand-blue)] text-white hover:bg-blue-700 rounded-lg font-bold transition-colors active:brightness-95 text-center text-sm"
+              style={{ textDecoration: 'none' }}
             >
               Create Secure Identity
             </Link>
             <Link
               to="/login"
-              className="w-full sm:w-auto px-7 py-3 bg-[var(--app-surface)] hover:bg-[var(--app-surface-muted)] text-[var(--app-text)] border border-[var(--app-border)] rounded-lg font-bold transition-all active:scale-[0.98] text-center text-sm"
+              className="w-full sm:w-auto px-7 py-3 bg-[var(--app-surface-muted)] hover:bg-[var(--app-surface)] text-[var(--app-text)] border border-[var(--app-border)] rounded-lg font-bold transition-all active:scale-[0.98] text-center text-sm shadow-sm"
+              style={{ textDecoration: 'none' }}
             >
               Unlock Drive
             </Link>
           </div>
 
-          <div className="grid sm:grid-cols-3 gap-3">
+          <div className="grid gap-3 sm:grid-cols-3">
             {[
               ['You first', 'Identity and control stay with the user.'],
               ['Verified', 'Fingerprint trust before sensitive sharing.'],
@@ -53,7 +55,7 @@ export const LandingPage: React.FC = () => {
           <div className="flex justify-center mb-8">
             <CrypShareLogo markSize={86} wordmarkClassName="text-4xl" />
           </div>
-          <div className="grid grid-cols-3 gap-3">
+          <div className="grid gap-3 sm:grid-cols-3">
             <div className="rounded-lg bg-[var(--app-surface-muted)] border border-[var(--app-border)] p-4">
               <Fingerprint className="w-5 h-5 text-[var(--brand-cyan)] mb-3" />
               <p className="text-xs text-[var(--app-muted)]">Identity fingerprints</p>
