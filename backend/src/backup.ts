@@ -10,6 +10,6 @@ main()
     console.error("Database backup failed.", err);
     process.exitCode = 1;
   })
-  .finally(() => {
-    closeDatabase();
+  .finally(async () => {
+    await closeDatabase();
   });

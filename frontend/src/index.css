@@ -72,6 +72,10 @@ body {
   min-height: 100vh;
   background: var(--app-main-bg);
   color: var(--app-text);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 button,
@@ -83,7 +87,7 @@ select {
 
 h1, h2, h3, h4, h5, h6 {
   font-family: inherit;
-  letter-spacing: -0.015em;
+  letter-spacing: 0;
 }
 
 @layer utilities {
@@ -140,7 +144,7 @@ h1, h2, h3, h4, h5, h6 {
     font-family: inherit;
     color: var(--brand-logo-text);
     font-weight: 500;
-    letter-spacing: -0.025em;
+    letter-spacing: 0;
   }
 
   .brand-app-icon-surface {
@@ -178,6 +182,7 @@ h1, h2, h3, h4, h5, h6 {
 
   .theme-toggle:hover {
     border-color: color-mix(in srgb, var(--brand-cyan) 55%, var(--app-border));
+    background: var(--app-surface-muted);
   }
 
   .animate-in {

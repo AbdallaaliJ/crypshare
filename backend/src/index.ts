@@ -6,6 +6,7 @@ import path from "path";
 import fs from "fs";
 import http from "http";
 import { WebSocketServer, type WebSocket } from "ws";
+import { BlobStorage, loadBlobStorageConfig } from "./blobStorage";
 import {
   addInboxFile,
   addPreKeys,
@@ -13,6 +14,8 @@ import {
   addVaultGrant,
   appendAuditEntry,
   approveWorkspaceMember,
+  checkDatabaseHealth,
+  closeDatabase,
   cleanupExpiredSessionRecords,
   consumeNextPreKey,
   approveUser,
@@ -60,11 +63,15 @@ import {
   updateWorkspaceMemberRole,
   usersShareActiveWorkspace
 } from "./database";
+import { DATABASE_DRIVER } from "./database";
 import type { InboxRecord, SessionRecord, UserRecord, VaultFileRecord, VaultGrantRecord, VaultGrantSignatureUpdate, WorkspaceMemberRecord } from "./database";
 
 const NODE_ENV = process.env.NODE_ENV || "development";
 const PUBLIC_DEPLOYMENT = process.env.CRYPSHARE_PUBLIC_DEPLOYMENT === "true" || NODE_ENV === "production";
+const TRUST_PROXY = process.env.TRUST_PROXY === "true";
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(__dirname, "../uploads");
+const blobStorageConfig = loadBlobStorageConfig(UPLOAD_DIR);
+const blobStorage = new BlobStorage(blobStorageConfig);
 const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || "256kb";
 const DEFAULT_UPLOAD_FILE_LIMIT_BYTES = 15 * 1024 * 1024 * 1024;
 const UPLOAD_FILE_LIMIT_BYTES = Number(process.env.UPLOAD_FILE_LIMIT_BYTES || DEFAULT_UPLOAD_FILE_LIMIT_BYTES);
@@ -89,48 +96,120 @@ const SESSION_COOKIE_SECURE = process.env.SESSION_COOKIE_SECURE
 const SESSION_COOKIE_SAMESITE = (process.env.SESSION_COOKIE_SAMESITE || "strict").toLowerCase();
 const SESSION_RETURN_BEARER_TOKEN = process.env.SESSION_RETURN_BEARER_TOKEN !== "false";
 const P2P_SESSION_TTL_MS = Math.max(Number(process.env.P2P_SESSION_TTL_MS || 1000 * 60 * 15), 1000 * 60);
+const P2P_SIGNAL_MAX_BYTES = Math.max(Number(process.env.P2P_SIGNAL_MAX_BYTES || 256 * 1024), 4096);
+const P2P_MAX_SOCKETS_PER_USER = Math.max(Number(process.env.P2P_MAX_SOCKETS_PER_USER || 5), 1);
+const P2P_MAX_ACTIVE_SESSIONS_PER_USER = Math.max(Number(process.env.P2P_MAX_ACTIVE_SESSIONS_PER_USER || 20), 1);
+const P2P_MAX_SIGNALING_TICKETS_PER_USER = Math.max(Number(process.env.P2P_MAX_SIGNALING_TICKETS_PER_USER || 5), 1);
 const P2P_STUN_URLS = (process.env.P2P_STUN_URLS || "")
   .split(",")
   .map((url) => url.trim())
   .filter(Boolean);
-const P2P_TURN_URLS = (process.env.P2P_TURN_URLS || "turn:127.0.0.1:3478?transport=udp,turn:127.0.0.1:3478?transport=tcp")
+const P2P_TURN_URLS = (process.env.P2P_TURN_URLS || "turn:127.0.0.1:3478?transport=tcp,turn:127.0.0.1:3478?transport=udp")
   .split(",")
   .map((url) => url.trim())
   .filter(Boolean);
-const P2P_TURN_USERNAME = process.env.P2P_TURN_USERNAME || "crypshare";
-const P2P_TURN_CREDENTIAL = process.env.P2P_TURN_CREDENTIAL || "change-this-turn-password";
+const P2P_TURN_SHARED_SECRET = (
+  process.env.P2P_TURN_SHARED_SECRET ||
+  process.env.TURN_SHARED_SECRET ||
+  (PUBLIC_DEPLOYMENT ? "" : "dev-only-turn-shared-secret-change-me")
+).trim();
+const P2P_TURN_CREDENTIAL_TTL_MS = Math.max(Number(process.env.P2P_TURN_CREDENTIAL_TTL_MS || 1000 * 60 * 10), 1000 * 60);
+const P2P_TURN_USERNAME = process.env.P2P_TURN_USERNAME || "";
+const P2P_TURN_CREDENTIAL = process.env.P2P_TURN_CREDENTIAL || "";
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || "")
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
+const DEV_CORS_ORIGIN_PATTERN = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/;
+
+function isPositiveFiniteNumber(value: number) {
+  return Number.isFinite(value) && value > 0;
+}
 
 function validateRuntimeConfig() {
   if (!PUBLIC_DEPLOYMENT) return;
 
   const failures: string[] = [];
+  if (process.env.TRUST_PROXY === undefined) {
+    failures.push("TRUST_PROXY must be set explicitly for public deployments.");
+  }
   if (CORS_ORIGINS.length === 0) {
     failures.push("CORS_ORIGINS must be set for public deployments.");
   }
-  if (!process.env.DATABASE_FILE) {
+  if (CORS_ORIGINS.includes("*")) {
+    failures.push("Wildcard CORS_ORIGINS is not allowed for public deployments.");
+  }
+  if (DATABASE_DRIVER === "postgres" || DATABASE_DRIVER === "postgresql") {
+    if (!process.env.DATABASE_URL) {
+      failures.push("DATABASE_URL must be set when DATABASE_DRIVER=postgres.");
+    }
+  } else if (!process.env.DATABASE_FILE) {
     failures.push("DATABASE_FILE must be set to a durable production database path.");
   }
-  if (!process.env.UPLOAD_DIR) {
-    failures.push("UPLOAD_DIR must be set to a durable encrypted blob storage path.");
+  if (blobStorageConfig.driver === "local" && !process.env.UPLOAD_DIR) {
+    failures.push("UPLOAD_DIR must be set to a durable encrypted blob storage path when STORAGE_DRIVER=local.");
+  }
+  if (blobStorageConfig.driver === "s3") {
+    if (!process.env.S3_ENDPOINT || !process.env.S3_BUCKET || !process.env.S3_ACCESS_KEY || !process.env.S3_SECRET_KEY) {
+      failures.push("S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY, and S3_SECRET_KEY must be set when STORAGE_DRIVER=s3.");
+    }
+    if (blobStorageConfig.accessKey === "crypshare" || blobStorageConfig.secretKey === "change-this-minio-password") {
+      failures.push("Default S3/MinIO credentials are not allowed in public deployments.");
+    }
   }
   if (P2P_TURN_URLS.length === 0) {
     failures.push("P2P_TURN_URLS must be configured because P2P is relay-only.");
   }
-  if (!process.env.P2P_TURN_USERNAME || !process.env.P2P_TURN_CREDENTIAL) {
-    failures.push("P2P_TURN_USERNAME and P2P_TURN_CREDENTIAL must be explicitly configured.");
+  if (!P2P_TURN_SHARED_SECRET) {
+    failures.push("P2P_TURN_SHARED_SECRET must be configured so public P2P uses short-lived TURN credentials.");
   }
-  if (P2P_TURN_USERNAME === "crypshare" || P2P_TURN_CREDENTIAL === "change-this-turn-password") {
-    failures.push("Default TURN credentials are not allowed in public deployments.");
+  if (P2P_TURN_SHARED_SECRET === "dev-only-turn-shared-secret-change-me") {
+    failures.push("The development TURN shared secret is not allowed in public deployments.");
+  }
+  if (P2P_TURN_USERNAME || P2P_TURN_CREDENTIAL) {
+    failures.push("Static P2P_TURN_USERNAME/P2P_TURN_CREDENTIAL are not allowed in public deployments; use P2P_TURN_SHARED_SECRET.");
+  }
+  if (!isPositiveFiniteNumber(UPLOAD_FILE_LIMIT_BYTES)) {
+    failures.push("UPLOAD_FILE_LIMIT_BYTES must be a positive number.");
+  }
+  if (!isPositiveFiniteNumber(UPLOAD_FIELD_LIMIT_BYTES)) {
+    failures.push("UPLOAD_FIELD_LIMIT_BYTES must be a positive number.");
+  }
+  if (!isPositiveFiniteNumber(VAULT_CHUNK_UPLOAD_LIMIT_BYTES)) {
+    failures.push("VAULT_CHUNK_UPLOAD_LIMIT_BYTES must be a positive number.");
+  }
+  if (!isPositiveFiniteNumber(USER_STORAGE_QUOTA_BYTES)) {
+    failures.push("USER_STORAGE_QUOTA_BYTES must be a positive number.");
+  }
+  if (!isPositiveFiniteNumber(GENERAL_RATE_LIMIT_WINDOW_MS) || !isPositiveFiniteNumber(GENERAL_RATE_LIMIT_MAX)) {
+    failures.push("RATE_LIMIT_WINDOW_MS and RATE_LIMIT_MAX must be positive numbers.");
+  }
+  if (!isPositiveFiniteNumber(AUTH_RATE_LIMIT_WINDOW_MS) || !isPositiveFiniteNumber(AUTH_RATE_LIMIT_MAX)) {
+    failures.push("AUTH_RATE_LIMIT_WINDOW_MS and AUTH_RATE_LIMIT_MAX must be positive numbers.");
+  }
+  if (!isPositiveFiniteNumber(P2P_SIGNAL_MAX_BYTES) || P2P_SIGNAL_MAX_BYTES < 4096) {
+    failures.push("P2P_SIGNAL_MAX_BYTES must be at least 4096 bytes.");
+  }
+  if (!isPositiveFiniteNumber(P2P_MAX_SOCKETS_PER_USER)) {
+    failures.push("P2P_MAX_SOCKETS_PER_USER must be a positive number.");
+  }
+  if (!isPositiveFiniteNumber(P2P_MAX_ACTIVE_SESSIONS_PER_USER)) {
+    failures.push("P2P_MAX_ACTIVE_SESSIONS_PER_USER must be a positive number.");
+  }
+  if (!isPositiveFiniteNumber(P2P_MAX_SIGNALING_TICKETS_PER_USER)) {
+    failures.push("P2P_MAX_SIGNALING_TICKETS_PER_USER must be a positive number.");
   }
   if (SESSION_TTL_MS > 1000 * 60 * 60 * 24) {
     failures.push("SESSION_TTL_MS should be 24 hours or less for public deployments.");
   }
+  if (!isPositiveFiniteNumber(SESSION_TTL_MS)) {
+    failures.push("SESSION_TTL_MS must be a positive number.");
+  }
   if (SESSION_COOKIE_ENABLED && SESSION_COOKIE_SECRET.length < 32) {
     failures.push("SESSION_COOKIE_SECRET must be at least 32 characters when session cookies are enabled.");
+  }
+  if (SESSION_COOKIE_ENABLED && SESSION_COOKIE_SAMESITE === "none" && !SESSION_COOKIE_SECURE) {
+    failures.push("SESSION_COOKIE_SAMESITE=none requires SESSION_COOKIE_SECURE=true.");
   }
   if (!SESSION_COOKIE_ENABLED && !SESSION_RETURN_BEARER_TOKEN) {
     failures.push("SESSION_RETURN_BEARER_TOKEN=false requires SESSION_COOKIE_ENABLED=true.");
@@ -145,6 +224,16 @@ validateRuntimeConfig();
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 const VAULT_CHUNK_SESSION_DIR = path.join(UPLOAD_DIR, ".chunk-sessions");
 fs.mkdirSync(VAULT_CHUNK_SESSION_DIR, { recursive: true });
+let blobStorageReady = false;
+let blobStorageInitError: string | null = null;
+const blobStorageReadyPromise = blobStorage.ensureReady().then(() => {
+  blobStorageReady = true;
+  blobStorageInitError = null;
+}).catch((err) => {
+  blobStorageInitError = err instanceof Error ? err.message : "Encrypted blob storage initialization failed.";
+  console.error("Encrypted blob storage initialization failed.", err);
+  process.exitCode = 1;
+});
 
 const uploadMiddleware = multer({
   dest: UPLOAD_DIR,
@@ -165,6 +254,7 @@ const chunkUploadMiddleware = multer({
 });
 export const app = express();
 const PORT = Number(process.env.PORT || 3001);
+app.set("trust proxy", TRUST_PROXY);
 const vaultUploadSessions = new Map<string, {
   id: string;
   ownerUsername: string;
@@ -194,7 +284,19 @@ const p2pSessions = new Map<string, {
 app.disable("x-powered-by");
 app.disable("etag");
 app.use(cors({
-  origin: CORS_ORIGINS.length > 0 ? CORS_ORIGINS : true,
+  origin(origin, callback) {
+    if (!origin) {
+      callback(null, true);
+      return;
+    }
+
+    if (CORS_ORIGINS.includes(origin) || (!PUBLIC_DEPLOYMENT && DEV_CORS_ORIGIN_PATTERN.test(origin))) {
+      callback(null, true);
+      return;
+    }
+
+    callback(null, false);
+  },
   credentials: SESSION_COOKIE_ENABLED
 }));
 app.use(requestContext);
@@ -203,7 +305,7 @@ app.use(createRateLimiter("general", GENERAL_RATE_LIMIT_WINDOW_MS, GENERAL_RATE_
 app.use(requestLogger);
 app.use(express.json({ limit: JSON_BODY_LIMIT }));
 
-app.get("/", (_req, res) => {
+app.get("/", async (_req, res) => {
   res.json({
     name: "CrypShare API",
     status: "ok",
@@ -340,6 +442,16 @@ function isLikelyEncryptedComponent(value: unknown) {
   return typeof value === "string" && value.length > 0 && value.length <= UPLOAD_FIELD_LIMIT_BYTES;
 }
 
+function isBoundedCredentialComponent(value: unknown) {
+  return typeof value === "string" && value.length > 0 && value.length <= 8192;
+}
+
+function isValidPreKeyRecord(value: unknown) {
+  if (!value || typeof value !== "object") return false;
+  const preKey = value as Record<string, unknown>;
+  return [preKey.publicKeyHex, preKey.encryptedPrivateKey, preKey.iv].every(isLikelyEncryptedComponent);
+}
+
 function createWorkspaceInvite() {
   return {
     inviteCode: crypto.randomBytes(16).toString("hex"),
@@ -360,8 +472,16 @@ function removeMulterFile(file?: Express.Multer.File) {
   fs.rmSync(file.path, { force: true });
 }
 
+async function persistUploadedObject(file: Express.Multer.File, key = file.filename) {
+  await blobStorage.putFile(key, file.path);
+  if (blobStorage.driver === "s3") {
+    removeMulterFile(file);
+  }
+}
+
 function removePathRecursive(targetPath: string) {
-  if (!targetPath.startsWith(VAULT_CHUNK_SESSION_DIR)) return;
+  const relative = path.relative(VAULT_CHUNK_SESSION_DIR, targetPath);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) return;
   fs.rmSync(targetPath, { recursive: true, force: true });
 }
 
@@ -375,8 +495,8 @@ function cleanupExpiredVaultUploadSessions() {
   }
 }
 
-function storageQuotaSnapshot(username: string, incomingBytes = 0, replacingBytes = 0) {
-  const usedBytes = getVaultStorageBytes(username);
+async function storageQuotaSnapshot(username: string, incomingBytes = 0, replacingBytes = 0) {
+  const usedBytes = await getVaultStorageBytes(username);
   const quotaBytes = USER_STORAGE_QUOTA_BYTES;
   const projectedBytes = Math.max(usedBytes - replacingBytes, 0) + incomingBytes;
   return {
@@ -420,7 +540,7 @@ async function assembleVaultChunks(session: { dir: string; expectedChunks: numbe
   });
 }
 
-function buildVaultGrant(ownerUsername: string, vaultFileId: string, input: Partial<VaultGrantRecord>) {
+async function buildVaultGrant(ownerUsername: string, vaultFileId: string, input: Partial<VaultGrantRecord>) {
   const { recipientUsername, wrappedFileKey, ephemeralPublicKey, usedPreKey, signature } = input;
   if (!recipientUsername || !wrappedFileKey || !ephemeralPublicKey || !usedPreKey || !signature) {
     return { status: 400, error: "Missing encrypted grant components" };
@@ -430,7 +550,7 @@ function buildVaultGrant(ownerUsername: string, vaultFileId: string, input: Part
     return { status: 400, error: "Use your owner vault access for your own files" };
   }
 
-  const recipient = getUser(recipientUsername);
+  const recipient = await getUser(recipientUsername);
   if (!recipient) {
     return { status: 404, error: `Recipient ${recipientUsername} not found` };
   }
@@ -438,11 +558,11 @@ function buildVaultGrant(ownerUsername: string, vaultFileId: string, input: Part
     return { status: 410, error: `Recipient ${recipientUsername} identity has been revoked` };
   }
 
-  if (!usersShareActiveWorkspace(ownerUsername, recipientUsername)) {
+  if (!await usersShareActiveWorkspace(ownerUsername, recipientUsername)) {
     return { status: 403, error: `Recipient ${recipientUsername} is not an active member of a shared workspace` };
   }
 
-  const matchingPreKey = getPreKey(recipientUsername, usedPreKey);
+  const matchingPreKey = await getPreKey(recipientUsername, usedPreKey);
   if (!matchingPreKey) {
     return { status: 400, error: `Recipient ${recipientUsername} pre-key was not found` };
   }
@@ -464,19 +584,19 @@ function buildVaultGrant(ownerUsername: string, vaultFileId: string, input: Part
   return { grant };
 }
 
-function createSession(username: string, userAgent: string) {
-  cleanupExpiredSessions();
+async function createSession(username: string, userAgent: string) {
+  await cleanupExpiredSessions();
   const token = crypto.randomBytes(32).toString("hex");
   const tokenHash = sha256Hex(token);
   const id = crypto.randomBytes(16).toString("hex");
   const createdAt = Date.now();
   const expiresAt = Date.now() + SESSION_TTL_MS;
-  createSessionRecord(tokenHash, { id, username, createdAt, expiresAt, userAgent });
+  await createSessionRecord(tokenHash, { id, username, createdAt, expiresAt, userAgent });
   return { token, tokenHash, id, expiresAt };
 }
 
-function cleanupExpiredSessions() {
-  cleanupExpiredSessionRecords();
+async function cleanupExpiredSessions() {
+  await cleanupExpiredSessionRecords();
 }
 
 function getBearerToken(req: express.Request) {
@@ -569,7 +689,7 @@ function clearSessionCookies(res: express.Response) {
   clearCookie(res, CSRF_COOKIE_NAME, false);
 }
 
-function getSession(req: express.Request) {
+async function getSession(req: express.Request) {
   const bearerToken = getBearerToken(req);
   if (bearerToken) return getSessionFromToken(bearerToken, "bearer");
 
@@ -577,15 +697,15 @@ function getSession(req: express.Request) {
   return getSessionFromToken(cookieToken, "cookie");
 }
 
-function getSessionFromToken(token: string, source: "bearer" | "cookie") {
+async function getSessionFromToken(token: string, source: "bearer" | "cookie") {
   if (!token) return null;
 
   const tokenHash = sha256Hex(token);
-  const session = getSessionByTokenHash(tokenHash);
+  const session = await getSessionByTokenHash(tokenHash);
   if (!session) return null;
 
   if (session.expiresAt < Date.now()) {
-    deleteSessionByTokenHash(tokenHash);
+    await deleteSessionByTokenHash(tokenHash);
     return null;
   }
 
@@ -611,24 +731,24 @@ function requireCookieCsrf(req: express.Request, res: express.Response, tokenHas
   return true;
 }
 
-function listUserSessions(username: string, currentSessionId: string) {
-  return listSessionRecords(username, currentSessionId);
+async function listUserSessions(username: string, currentSessionId: string) {
+  return await listSessionRecords(username, currentSessionId);
 }
 
-function revokeSession(username: string, sessionId: string) {
+async function revokeSession(username: string, sessionId: string) {
   return deleteSessionById(username, sessionId);
 }
 
-function revokeOtherSessions(username: string, currentSessionId: string) {
+async function revokeOtherSessions(username: string, currentSessionId: string) {
   return deleteOtherSessions(username, currentSessionId);
 }
 
-function revokeAllSessions(username: string) {
+async function revokeAllSessions(username: string) {
   return deleteAllSessions(username);
 }
 
-function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
-  const authSession = getSession(req);
+async function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const authSession = await getSession(req);
   if (!authSession) {
     res.status(401).json({ error: "Authentication required" });
     return;
@@ -638,9 +758,9 @@ function requireAuth(req: express.Request, res: express.Response, next: express.
     return;
   }
 
-  const userRecord = getUser(authSession.session.username);
+  const userRecord = await getUser(authSession.session.username);
   if (!userRecord || userRecord.revokedAt) {
-    deleteSessionByTokenHash(authSession.tokenHash);
+    await deleteSessionByTokenHash(authSession.tokenHash);
     res.status(403).json({ error: "Identity is not active" });
     return;
   }
@@ -691,26 +811,26 @@ function serializeWorkspaceMember(member: WorkspaceMemberRecord) {
   };
 }
 
-function requireWorkspaceMember(workspaceId: string, username: string) {
-  const membership = getWorkspaceMembership(workspaceId, username);
+async function requireWorkspaceMember(workspaceId: string, username: string) {
+  const membership = await getWorkspaceMembership(workspaceId, username);
   if (!membership || membership.status !== "active") return null;
   return membership;
 }
 
-function requireWorkspaceAdmin(workspaceId: string, username: string) {
-  const membership = requireWorkspaceMember(workspaceId, username);
+async function requireWorkspaceAdmin(workspaceId: string, username: string) {
+  const membership = await requireWorkspaceMember(workspaceId, username);
   if (!membership || !["owner", "admin"].includes(membership.role)) return null;
   return membership;
 }
 
-function requireWorkspaceOwner(workspaceId: string, username: string) {
-  const membership = requireWorkspaceMember(workspaceId, username);
+async function requireWorkspaceOwner(workspaceId: string, username: string) {
+  const membership = await requireWorkspaceMember(workspaceId, username);
   if (!membership || membership.role !== "owner") return null;
   return membership;
 }
 
-function appendAuditLog(userId: string, action: string, context: AuditContext = {}) {
-  const previousHash = getLastAuditHash() || GENESIS_HASH;
+async function appendAuditLog(userId: string, action: string, context: AuditContext = {}) {
+  const previousHash = await getLastAuditHash() || GENESIS_HASH;
   const timestamp = Date.now();
   
   const actorId = context.actorId || userId;
@@ -720,11 +840,11 @@ function appendAuditLog(userId: string, action: string, context: AuditContext = 
   const payload = JSON.stringify([timestamp, userId, action, actorId, subjectId, workspaceId, visibility]) + previousHash;
   const hash = crypto.createHash('sha256').update(payload).digest('hex');
   
-  appendAuditEntry({ timestamp, userId, action, previousHash, hash, actorId, subjectId, workspaceId, visibility });
+  await appendAuditEntry({ timestamp, userId, action, previousHash, hash, actorId, subjectId, workspaceId, visibility });
   console.log(`[AUDIT LOG] ${action} -> [Hash: ${hash.substring(0, 8)}...]`);
 }
 
-function visibleAuditHashPayload(entry: ReturnType<typeof getVisibleAuditLog>[number]) {
+function visibleAuditHashPayload(entry: Awaited<ReturnType<typeof getVisibleAuditLog>>[number]) {
   return JSON.stringify([
     entry.timestamp,
     entry.userId,
@@ -736,11 +856,11 @@ function visibleAuditHashPayload(entry: ReturnType<typeof getVisibleAuditLog>[nu
   ]);
 }
 
-function buildVisibleAuditView(username: string) {
-  const adminWorkspaceIds = listWorkspacesForUser(username)
+async function buildVisibleAuditView(username: string) {
+  const adminWorkspaceIds = (await listWorkspacesForUser(username))
     .filter((workspace) => workspace.status === "active" && ["owner", "admin"].includes(workspace.role || ""))
     .map((workspace) => workspace.id);
-  const visibleEntries = getVisibleAuditLog(username, adminWorkspaceIds);
+  const visibleEntries = await getVisibleAuditLog(username, adminWorkspaceIds);
   let previousHash = GENESIS_HASH;
 
   return visibleEntries.map((entry) => {
@@ -755,7 +875,7 @@ function buildVisibleAuditView(username: string) {
   });
 }
 
-function visibleAuditSummary(entries: ReturnType<typeof buildVisibleAuditView>) {
+function visibleAuditSummary(entries: Awaited<ReturnType<typeof buildVisibleAuditView>>) {
   const latestEntry = entries.length > 0 ? entries[entries.length - 1] : null;
   return {
     blockCount: entries.length,
@@ -786,8 +906,12 @@ function cleanupExpiredP2PSessions() {
 
 function addP2PClient(username: string, socket: WebSocket) {
   const sockets = p2pClients.get(username) || new Set<WebSocket>();
+  if (sockets.size >= P2P_MAX_SOCKETS_PER_USER) {
+    return false;
+  }
   sockets.add(socket);
   p2pClients.set(username, sockets);
+  return true;
 }
 
 function removeP2PClient(username: string, socket: WebSocket) {
@@ -804,6 +928,7 @@ function routeP2PMessage(username: string, message: Record<string, unknown>) {
   if (!sockets) return false;
 
   const payload = JSON.stringify(message);
+  if (Buffer.byteLength(payload) > P2P_SIGNAL_MAX_BYTES) return false;
   let delivered = false;
   for (const socket of sockets) {
     if (socket.readyState === socket.OPEN) {
@@ -815,6 +940,7 @@ function routeP2PMessage(username: string, message: Record<string, unknown>) {
 }
 
 function parseP2PMessage(raw: Buffer) {
+  if (raw.byteLength > P2P_SIGNAL_MAX_BYTES) return null;
   try {
     const parsed = JSON.parse(raw.toString()) as Record<string, unknown>;
     return parsed && typeof parsed.type === "string" ? parsed : null;
@@ -838,8 +964,20 @@ function cleanupP2PSignalingTickets() {
   }
 }
 
+function countP2PSignalingTicketsForUser(username: string) {
+  cleanupP2PSignalingTickets();
+  let count = 0;
+  for (const ticket of p2pSignalingTickets.values()) {
+    if (ticket.username === username) count += 1;
+  }
+  return count;
+}
+
 function createP2PSignalingTicket(username: string) {
   cleanupP2PSignalingTickets();
+  if (countP2PSignalingTicketsForUser(username) >= P2P_MAX_SIGNALING_TICKETS_PER_USER) {
+    return null;
+  }
   const ticket = crypto.randomBytes(32).toString("base64url");
   const ticketHash = sha256Hex(ticket);
   const expiresAt = Date.now() + P2P_SIGNALING_TICKET_TTL_MS;
@@ -870,10 +1008,19 @@ function getP2PSessionForUser(sessionId: unknown, username: string) {
   return [session.senderUsername, session.recipientUsername].includes(username) ? session : null;
 }
 
-function attachP2PSignaling(server: http.Server) {
-  const websocketServer = new WebSocketServer({ noServer: true });
+function countP2PActiveSessionsForUser(username: string) {
+  cleanupExpiredP2PSessions();
+  let count = 0;
+  for (const session of p2pSessions.values()) {
+    if (session.senderUsername === username || session.recipientUsername === username) count += 1;
+  }
+  return count;
+}
 
-  server.on("upgrade", (req, socket, head) => {
+function attachP2PSignaling(server: http.Server) {
+  const websocketServer = new WebSocketServer({ noServer: true, maxPayload: P2P_SIGNAL_MAX_BYTES });
+
+  server.on("upgrade", async (req, socket, head) => {
     const requestUrl = new URL(req.url || "", `http://${req.headers.host || "localhost"}`);
     if (requestUrl.pathname !== "/p2p/signaling") return;
 
@@ -885,7 +1032,7 @@ function attachP2PSignaling(server: http.Server) {
       return;
     }
 
-    const userRecord = getUser(ticketUsername);
+    const userRecord = await getUser(ticketUsername);
     if (!userRecord || userRecord.revokedAt) {
       socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
       socket.destroy();
@@ -897,17 +1044,20 @@ function attachP2PSignaling(server: http.Server) {
     });
   });
 
-  websocketServer.on("connection", (socket: WebSocket, _req: http.IncomingMessage, username: string) => {
-    const userRecord = getUser(username);
+  websocketServer.on("connection", async (socket: WebSocket, _req: http.IncomingMessage, username: string) => {
+    const userRecord = await getUser(username);
     if (!userRecord || userRecord.revokedAt) {
       socket.close();
       return;
     }
 
-    addP2PClient(username, socket);
+    if (!addP2PClient(username, socket)) {
+      socket.close(1013, "Too many active P2P connections for this identity.");
+      return;
+    }
     socket.send(JSON.stringify({ type: "p2p-ready", username }));
 
-    socket.on("message", (raw) => {
+    socket.on("message", async (raw) => {
       cleanupExpiredP2PSessions();
       const message = parseP2PMessage(Buffer.isBuffer(raw) ? raw : Buffer.from(raw.toString()));
       if (!message) {
@@ -925,14 +1075,22 @@ function attachP2PSignaling(server: http.Server) {
           sendP2PError(socket, "Choose another recipient.");
           return;
         }
-        const recipient = getUser(recipientUsername);
+        const recipient = await getUser(recipientUsername);
         if (!recipient || recipient.revokedAt) {
           sendP2PError(socket, "Recipient identity is unavailable.");
           return;
         }
-        const usersShareWorkspace = usersShareActiveWorkspace(username, recipientUsername);
+        const usersShareWorkspace = await usersShareActiveWorkspace(username, recipientUsername);
         if (!usersShareWorkspace && !fingerprintAllowsIdentityAccess(recipientUsername, recipient, message.recipientFingerprint)) {
           sendP2PError(socket, "Recipient identity invite fingerprint is required for unknown-user P2P.");
+          return;
+        }
+        if (countP2PActiveSessionsForUser(username) >= P2P_MAX_ACTIVE_SESSIONS_PER_USER) {
+          sendP2PError(socket, "Too many active P2P sessions for this identity.");
+          return;
+        }
+        if (countP2PActiveSessionsForUser(recipientUsername) >= P2P_MAX_ACTIVE_SESSIONS_PER_USER) {
+          sendP2PError(socket, "Recipient has too many active P2P sessions.");
           return;
         }
 
@@ -946,7 +1104,7 @@ function attachP2PSignaling(server: http.Server) {
           expiresAt: Date.now() + P2P_SESSION_TTL_MS
         };
         p2pSessions.set(sessionId, session);
-        appendAuditLog(username, "P2P Invite Created", {
+        await appendAuditLog(username, "P2P Invite Created", {
           actorId: username,
           subjectId: recipientUsername
         });
@@ -986,7 +1144,7 @@ function attachP2PSignaling(server: http.Server) {
 
         if (message.type === "p2p-decline") {
           p2pSessions.delete(session.id);
-          appendAuditLog(username, "P2P Declined", {
+          await appendAuditLog(username, "P2P Declined", {
             actorId: username,
             subjectId: session.senderUsername
           });
@@ -998,7 +1156,7 @@ function attachP2PSignaling(server: http.Server) {
           return;
         }
 
-        appendAuditLog(username, "P2P Accepted", {
+        await appendAuditLog(username, "P2P Accepted", {
           actorId: username,
           subjectId: session.senderUsername
         });
@@ -1024,14 +1182,14 @@ function attachP2PSignaling(server: http.Server) {
         }
 
         if (signalType === "completed") {
-          appendAuditLog(username, "P2P Completed", {
+          await appendAuditLog(username, "P2P Completed", {
             actorId: username,
             subjectId: username === session.senderUsername ? session.recipientUsername : session.senderUsername
           });
           p2pSessions.delete(session.id);
         }
         if (signalType === "failed") {
-          appendAuditLog(username, "P2P Failed", {
+          await appendAuditLog(username, "P2P Failed", {
             actorId: username,
             subjectId: username === session.senderUsername ? session.recipientUsername : session.senderUsername
           });
@@ -1068,11 +1226,105 @@ function attachP2PSignaling(server: http.Server) {
   return websocketServer;
 }
 
-app.get("/health", (req, res) => {
-  res.json({ status: "ok" });
+async function getReadinessStatus() {
+  if (!blobStorageReady) {
+    await Promise.race([
+      blobStorageReadyPromise,
+      new Promise((resolve) => setTimeout(resolve, 250))
+    ]);
+  }
+
+  let databaseReady = false;
+  let databaseDriver = DATABASE_DRIVER;
+  let databaseError: string | null = null;
+  try {
+    const databaseHealth = await checkDatabaseHealth();
+    databaseReady = databaseHealth.ok;
+    databaseDriver = databaseHealth.driver;
+  } catch (err) {
+    databaseError = err instanceof Error ? err.message : "Database health check failed.";
+  }
+
+  return {
+    ready: blobStorageReady && databaseReady,
+    status: blobStorageReady && databaseReady ? "ok" : "degraded",
+    storage: {
+      driver: blobStorageConfig.driver,
+      ready: blobStorageReady,
+      error: blobStorageReady ? null : blobStorageInitError || "Encrypted blob storage is still initializing."
+    },
+    database: {
+      driver: databaseDriver,
+      ready: databaseReady,
+      error: databaseError
+    }
+  };
+}
+
+function createTurnIceServer(username: string) {
+  if (P2P_TURN_URLS.length === 0) return null;
+
+  if (P2P_TURN_SHARED_SECRET) {
+    const expiresAtMs = Date.now() + P2P_TURN_CREDENTIAL_TTL_MS;
+    const expiresAtUnix = Math.floor(expiresAtMs / 1000);
+    const safeUsername = username.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const turnUsername = `${expiresAtUnix}:${safeUsername}`;
+    const credential = crypto
+      .createHmac("sha1", P2P_TURN_SHARED_SECRET)
+      .update(turnUsername)
+      .digest("base64");
+
+    return {
+      iceServer: {
+        urls: P2P_TURN_URLS,
+        username: turnUsername,
+        credential
+      } as RTCIceServer,
+      credentialMode: "ephemeral" as const,
+      credentialExpiresAt: new Date(expiresAtMs).toISOString(),
+      credentialTtlMs: P2P_TURN_CREDENTIAL_TTL_MS
+    };
+  }
+
+  if (P2P_TURN_USERNAME && P2P_TURN_CREDENTIAL) {
+    return {
+      iceServer: {
+        urls: P2P_TURN_URLS,
+        username: P2P_TURN_USERNAME,
+        credential: P2P_TURN_CREDENTIAL
+      } as RTCIceServer,
+      credentialMode: "static" as const,
+      credentialExpiresAt: null,
+      credentialTtlMs: null
+    };
+  }
+
+  return null;
+}
+
+app.get("/health", async (_req, res) => {
+  const readiness = await getReadinessStatus();
+
+  if (!readiness.ready) {
+    res.status(503).json(readiness);
+    return;
+  }
+
+  res.json(readiness);
 });
 
-app.get("/upload-limits", (req, res) => {
+app.get("/ready", async (_req, res) => {
+  const readiness = await getReadinessStatus();
+
+  if (!blobStorageReady) {
+    res.status(503).json(readiness);
+    return;
+  }
+
+  res.status(readiness.ready ? 200 : 503).json(readiness);
+});
+
+app.get("/upload-limits", async (req, res) => {
   res.json({
     uploadFileLimitBytes: UPLOAD_FILE_LIMIT_BYTES,
     uploadFieldLimitBytes: UPLOAD_FIELD_LIMIT_BYTES,
@@ -1083,43 +1335,46 @@ app.get("/upload-limits", (req, res) => {
   });
 });
 
-app.get("/p2p/ice-config", requireAuth, (_req, res) => {
-  const turnConfigured = P2P_TURN_URLS.length > 0 && !!P2P_TURN_USERNAME && !!P2P_TURN_CREDENTIAL;
-  const turnServers: RTCIceServer[] = turnConfigured ? [{
-    urls: P2P_TURN_URLS,
-    username: P2P_TURN_USERNAME,
-    credential: P2P_TURN_CREDENTIAL
-  }] : [];
+app.get("/p2p/ice-config", requireAuth, async (_req, res) => {
+  const turnConfig = createTurnIceServer(res.locals.authUsername);
+  const turnServers: RTCIceServer[] = turnConfig ? [turnConfig.iceServer] : [];
   res.json({
     iceServers: turnServers,
-    turnConfigured,
+    turnConfigured: !!turnConfig,
+    credentialMode: turnConfig?.credentialMode || "unconfigured",
+    credentialExpiresAt: turnConfig?.credentialExpiresAt || null,
+    credentialTtlMs: turnConfig?.credentialTtlMs || null,
     relayOnly: true,
     sessionTtlMs: P2P_SESSION_TTL_MS,
-    privacyNote: "P2P uses TURN relay-only mode. TURN can see IPs, timing, and packet sizes, but CrypShare encrypts file metadata and chunks before WebRTC sends them."
+    privacyNote: "P2P uses TURN relay-only mode with short-lived relay credentials when configured. TURN can see IPs, timing, and packet sizes, but CrypShare encrypts file metadata and chunks before WebRTC sends them."
   });
 });
 
-app.post("/p2p/signaling-ticket", requireAuth, (_req, res) => {
+app.post("/p2p/signaling-ticket", requireAuth, async (_req, res) => {
   const ticket = createP2PSignalingTicket(res.locals.authUsername);
+  if (!ticket) {
+    res.status(429).json({ error: "Too many active P2P signaling tickets. Wait for an existing ticket to expire." });
+    return;
+  }
   res.json({
     ...ticket,
     ttlMs: P2P_SIGNALING_TICKET_TTL_MS
   });
 });
 
-app.get("/p2p/identity/:username", requireAuth, (req, res) => {
+app.get("/p2p/identity/:username", requireAuth, async (req, res) => {
   if (!isSafeUsername(req.params.username)) {
     res.status(400).json({ error: "Invalid username" });
     return;
   }
 
-  const userRecord = getUser(req.params.username);
+  const userRecord = await getUser(req.params.username);
   if (!userRecord || userRecord.revokedAt) {
     res.status(userRecord?.revokedAt ? 410 : 404).json({ error: "P2P identity unavailable" });
     return;
   }
 
-  const sharedWorkspace = usersShareActiveWorkspace(res.locals.authUsername, req.params.username);
+  const sharedWorkspace = await usersShareActiveWorkspace(res.locals.authUsername, req.params.username);
   const inviteFingerprint = req.query.fingerprint;
   if (req.params.username !== res.locals.authUsername && !sharedWorkspace && !fingerprintAllowsIdentityAccess(req.params.username, userRecord, inviteFingerprint)) {
     res.status(403).json({ error: "Identity invite fingerprint required for unknown-user P2P" });
@@ -1135,7 +1390,7 @@ app.get("/p2p/identity/:username", requireAuth, (req, res) => {
 
 const authRateLimiter = createRateLimiter("auth", AUTH_RATE_LIMIT_WINDOW_MS, AUTH_RATE_LIMIT_MAX);
 
-app.post("/register", authRateLimiter, (req, res) => {
+app.post("/register", authRateLimiter, async (req, res) => {
   const { username, salt, authSalt, authVerifierHash, identityPublicKeyECDH, identityPublicKeyECDSA, encryptedPrivateKeyECDH, ivECDH, encryptedPrivateKeyECDSA, ivECDSA } = req.body;
   if (!username || !salt || !authSalt || !authVerifierHash || !identityPublicKeyECDH || !identityPublicKeyECDSA || !encryptedPrivateKeyECDH || !ivECDH || !encryptedPrivateKeyECDSA || !ivECDSA) {
     res.status(400).json({ error: "Missing required fields" });
@@ -1145,12 +1400,16 @@ app.post("/register", authRateLimiter, (req, res) => {
     res.status(400).json({ error: "Username must be 2-40 characters using letters, numbers, dots, underscores, or hyphens" });
     return;
   }
-  if (getUser(username)) {
+  if (![salt, authSalt, authVerifierHash, identityPublicKeyECDH, identityPublicKeyECDSA, encryptedPrivateKeyECDH, ivECDH, encryptedPrivateKeyECDSA, ivECDSA].every(isBoundedCredentialComponent)) {
+    res.status(400).json({ error: "Invalid identity payload size" });
+    return;
+  }
+  if (await getUser(username)) {
     res.status(409).json({ error: "Username already exists" });
     return;
   }
 
-  const approvedUserCount = countApprovedUsers();
+  const approvedUserCount = await countApprovedUsers();
   const bootstrapAdmin = approvedUserCount === 0;
   const approvedAt = Date.now();
 
@@ -1169,9 +1428,9 @@ app.post("/register", authRateLimiter, (req, res) => {
     approvedAt,
     approvedBy: "self-service"
   };
-  createUser(username, userRecord);
+  await createUser(username, userRecord);
 
-  appendAuditLog(username, bootstrapAdmin ? "Bootstrap Admin Registration" : "Identity Registration");
+  await appendAuditLog(username, bootstrapAdmin ? "Bootstrap Admin Registration" : "Identity Registration");
 
   console.log(`Registered user: ${username}`);
   console.log(`Stored Identity payload keys:`, Object.keys(userRecord));
@@ -1183,9 +1442,13 @@ app.post("/register", authRateLimiter, (req, res) => {
   });
 });
 
-app.get("/session-material/:username", authRateLimiter, (req, res) => {
+app.get("/session-material/:username", authRateLimiter, async (req, res) => {
   const { username } = req.params;
-  const userRecord = getUser(username);
+  if (!isSafeUsername(username)) {
+    res.status(400).json({ error: "Invalid username" });
+    return;
+  }
+  const userRecord = await getUser(username);
 
   if (!userRecord) {
     res.status(404).json({ error: "User not found" });
@@ -1205,14 +1468,18 @@ app.get("/session-material/:username", authRateLimiter, (req, res) => {
   res.json({ salt: userRecord.salt, authSalt: userRecord.authSalt });
 });
 
-app.post("/sessions", authRateLimiter, (req, res) => {
+app.post("/sessions", authRateLimiter, async (req, res) => {
   const { username, authSecret } = req.body;
-  const userRecord = getUser(username);
-
   if (!username || !authSecret) {
     res.status(400).json({ error: "Missing username or auth secret" });
     return;
   }
+  if (!isSafeUsername(username) || !isBoundedCredentialComponent(authSecret)) {
+    res.status(401).json({ error: "Invalid credentials" });
+    return;
+  }
+
+  const userRecord = await getUser(username);
 
   if (!userRecord?.authVerifierHash || userRecord.revokedAt) {
     res.status(401).json({ error: "Invalid credentials" });
@@ -1225,9 +1492,9 @@ app.post("/sessions", authRateLimiter, (req, res) => {
     return;
   }
 
-  const session = createSession(username, req.get("user-agent") || "Unknown client");
+  const session = await createSession(username, req.get("user-agent") || "Unknown client");
   const csrfToken = setSessionCookies(res, session.token, session.tokenHash, session.expiresAt);
-  appendAuditLog(username, "Session Established");
+  await appendAuditLog(username, "Session Established");
   res.json({
     token: SESSION_RETURN_BEARER_TOKEN ? session.token : undefined,
     id: session.id,
@@ -1237,43 +1504,43 @@ app.post("/sessions", authRateLimiter, (req, res) => {
   });
 });
 
-app.get("/sessions", requireAuth, (req, res) => {
+app.get("/sessions", requireAuth, async (req, res) => {
   res.json({
-    sessions: listUserSessions(res.locals.authUsername, res.locals.authSessionId)
+    sessions: await listUserSessions(res.locals.authUsername, res.locals.authSessionId)
   });
 });
 
-app.delete("/sessions/current", requireAuth, (req, res) => {
-  deleteSessionByTokenHash(res.locals.authTokenHash);
+app.delete("/sessions/current", requireAuth, async (req, res) => {
+  await deleteSessionByTokenHash(res.locals.authTokenHash);
   clearSessionCookies(res);
-  appendAuditLog(res.locals.authUsername, "Session Revoked");
+  await appendAuditLog(res.locals.authUsername, "Session Revoked");
   res.json({ message: "Current session revoked" });
 });
 
-app.delete("/sessions/:sessionId", requireAuth, (req, res) => {
-  const revoked = revokeSession(res.locals.authUsername, req.params.sessionId);
+app.delete("/sessions/:sessionId", requireAuth, async (req, res) => {
+  const revoked = await revokeSession(res.locals.authUsername, req.params.sessionId);
   if (!revoked) {
     res.status(404).json({ error: "Session not found" });
     return;
   }
 
-  appendAuditLog(res.locals.authUsername, "Session Revoked");
+  await appendAuditLog(res.locals.authUsername, "Session Revoked");
   res.json({ message: "Session revoked" });
 });
 
-app.post("/sessions/revoke-others", requireAuth, (req, res) => {
-  const revoked = revokeOtherSessions(res.locals.authUsername, res.locals.authSessionId);
-  appendAuditLog(res.locals.authUsername, "Other Sessions Revoked");
+app.post("/sessions/revoke-others", requireAuth, async (req, res) => {
+  const revoked = await revokeOtherSessions(res.locals.authUsername, res.locals.authSessionId);
+  await appendAuditLog(res.locals.authUsername, "Other Sessions Revoked");
   res.json({ message: "Other sessions revoked", revoked });
 });
 
-app.post("/identity/:username/revoke", requireAuth, requireSelf, (req, res) => {
+app.post("/identity/:username/revoke", requireAuth, requireSelf, async (req, res) => {
   const { username } = req.params;
   const reason = typeof req.body?.reason === "string" && req.body.reason.trim()
     ? req.body.reason.trim().slice(0, 240)
     : "User requested emergency identity revocation";
 
-  const userRecord = getUser(username);
+  const userRecord = await getUser(username);
   if (!userRecord) {
     res.status(404).json({ error: "User not found" });
     return;
@@ -1284,20 +1551,21 @@ app.post("/identity/:username/revoke", requireAuth, requireSelf, (req, res) => {
     return;
   }
 
-  const revocation = revokeUser(username, reason);
+  const revocation = await revokeUser(username, reason);
   if (!revocation) {
     res.status(409).json({ error: "Identity already revoked" });
     return;
   }
 
-  const revokedSessions = revokeAllSessions(username);
+  const revokedSessions = await revokeAllSessions(username);
   clearSessionCookies(res);
-  appendAuditLog(username, "Identity Revoked");
+  await appendAuditLog(username, "Identity Revoked");
   res.json({ message: "Identity revoked", revokedAt: revocation.revokedAt, revokedSessions });
 });
 
-app.get("/admin/pending-identities", requireAuth, requireAdmin, (_req, res) => {
-  const pending = listPendingUsers().map((user) => ({
+app.get("/admin/pending-identities", requireAuth, requireAdmin, async (_req, res) => {
+  const pendingUsers = await listPendingUsers();
+  const pending = pendingUsers.map((user) => ({
     username: user.username,
     identityPublicKeyECDH: user.identity_public_key_ecdh,
     identityPublicKeyECDSA: user.identity_public_key_ecdsa
@@ -1305,14 +1573,14 @@ app.get("/admin/pending-identities", requireAuth, requireAdmin, (_req, res) => {
   res.json({ pending });
 });
 
-app.post("/admin/identities/:username/approve", requireAuth, requireAdmin, (req, res) => {
+app.post("/admin/identities/:username/approve", requireAuth, requireAdmin, async (req, res) => {
   const { username } = req.params;
   if (username === res.locals.authUsername) {
     res.status(400).json({ error: "Current identity is already active" });
     return;
   }
 
-  const userRecord = getUser(username);
+  const userRecord = await getUser(username);
   if (!userRecord) {
     res.status(404).json({ error: "Identity not found" });
     return;
@@ -1326,17 +1594,17 @@ app.post("/admin/identities/:username/approve", requireAuth, requireAdmin, (req,
     return;
   }
 
-  const approval = approveUser(username, res.locals.authUsername);
+  const approval = await approveUser(username, res.locals.authUsername);
   if (!approval) {
     res.status(409).json({ error: "Identity could not be approved" });
     return;
   }
 
-  appendAuditLog(username, "Identity Approved");
+  await appendAuditLog(username, "Identity Approved");
   res.json({ message: "Identity approved", approvedAt: approval.approvedAt, approvedBy: approval.approvedBy });
 });
 
-app.post("/workspaces", requireAuth, (req, res) => {
+app.post("/workspaces", requireAuth, async (req, res) => {
   const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
   if (!name) {
     res.status(400).json({ error: "Workspace name is required" });
@@ -1357,8 +1625,8 @@ app.post("/workspaces", requireAuth, (req, res) => {
     createdAt: Date.now()
   };
 
-  const ownerMembership = createWorkspace(workspace, res.locals.authUsername);
-  appendAuditLog(res.locals.authUsername, "Workspace Created", {
+  const ownerMembership = await createWorkspace(workspace, res.locals.authUsername);
+  await appendAuditLog(res.locals.authUsername, "Workspace Created", {
     actorId: res.locals.authUsername,
     subjectId: res.locals.authUsername,
     workspaceId: workspace.id,
@@ -1367,21 +1635,22 @@ app.post("/workspaces", requireAuth, (req, res) => {
   res.json({ workspace: { ...workspace, role: ownerMembership?.role, status: ownerMembership?.status, memberCount: 1, pendingCount: 0 } });
 });
 
-app.get("/workspaces", requireAuth, (_req, res) => {
-  res.json({ workspaces: listWorkspacesForUser(res.locals.authUsername) });
+app.get("/workspaces", requireAuth, async (_req, res) => {
+  res.json({ workspaces: await listWorkspacesForUser(res.locals.authUsername) });
 });
 
-app.get("/workspaces/:id/members", requireAuth, (req, res) => {
-  const membership = requireWorkspaceMember(req.params.id, res.locals.authUsername);
+app.get("/workspaces/:id/members", requireAuth, async (req, res) => {
+  const membership = await requireWorkspaceMember(req.params.id, res.locals.authUsername);
   if (!membership) {
     res.status(403).json({ error: "Active workspace membership required" });
     return;
   }
 
-  res.json({ members: listWorkspaceMembers(req.params.id).map(serializeWorkspaceMember) });
+  const members = await listWorkspaceMembers(req.params.id);
+  res.json({ members: members.map(serializeWorkspaceMember) });
 });
 
-app.post("/workspaces/:id/join", requireAuth, (req, res) => {
+app.post("/workspaces/:id/join", requireAuth, async (req, res) => {
   const inviteCode = typeof req.body?.inviteCode === "string" ? req.body.inviteCode.trim() : "";
   if (!inviteCode) {
     res.status(400).json({ error: "Workspace invite code is required" });
@@ -1392,13 +1661,13 @@ app.post("/workspaces/:id/join", requireAuth, (req, res) => {
     return;
   }
 
-  const workspace = findWorkspaceById(req.params.id);
+  const workspace = await findWorkspaceById(req.params.id);
   if (!workspace) {
     res.status(404).json({ error: "Workspace not found" });
     return;
   }
 
-  const inviteWorkspace = findWorkspaceByInviteCode(inviteCode);
+  const inviteWorkspace = await findWorkspaceByInviteCode(inviteCode);
   if (!inviteWorkspace || inviteWorkspace.id !== workspace.id) {
     res.status(403).json({ error: "Invalid workspace invite code" });
     return;
@@ -1408,13 +1677,13 @@ app.post("/workspaces/:id/join", requireAuth, (req, res) => {
     return;
   }
 
-  const membership = requestWorkspaceJoin(workspace.id, res.locals.authUsername);
+  const membership = await requestWorkspaceJoin(workspace.id, res.locals.authUsername);
   if (!membership) {
     res.status(500).json({ error: "Unable to request workspace access" });
     return;
   }
 
-  appendAuditLog(res.locals.authUsername, "Workspace Join Requested", {
+  await appendAuditLog(res.locals.authUsername, "Workspace Join Requested", {
     actorId: res.locals.authUsername,
     subjectId: res.locals.authUsername,
     workspaceId: workspace.id,
@@ -1426,37 +1695,38 @@ app.post("/workspaces/:id/join", requireAuth, (req, res) => {
   });
 });
 
-app.get("/workspaces/:id/pending-members", requireAuth, (req, res) => {
-  const adminMembership = requireWorkspaceAdmin(req.params.id, res.locals.authUsername);
+app.get("/workspaces/:id/pending-members", requireAuth, async (req, res) => {
+  const adminMembership = await requireWorkspaceAdmin(req.params.id, res.locals.authUsername);
   if (!adminMembership) {
     res.status(403).json({ error: "Workspace admin approval required" });
     return;
   }
 
-  res.json({ pending: listPendingWorkspaceMembers(req.params.id).map(serializeWorkspaceMember) });
+  const pendingMembers = await listPendingWorkspaceMembers(req.params.id);
+  res.json({ pending: pendingMembers.map(serializeWorkspaceMember) });
 });
 
-app.post("/workspaces/:id/invite/rotate", requireAuth, (req, res) => {
-  const adminMembership = requireWorkspaceAdmin(req.params.id, res.locals.authUsername);
+app.post("/workspaces/:id/invite/rotate", requireAuth, async (req, res) => {
+  const adminMembership = await requireWorkspaceAdmin(req.params.id, res.locals.authUsername);
   if (!adminMembership) {
     res.status(403).json({ error: "Workspace admin approval required" });
     return;
   }
 
-  const workspace = findWorkspaceById(req.params.id);
+  const workspace = await findWorkspaceById(req.params.id);
   if (!workspace) {
     res.status(404).json({ error: "Workspace not found" });
     return;
   }
 
   const invite = createWorkspaceInvite();
-  const rotatedWorkspace = rotateWorkspaceInvite(workspace.id, invite.inviteCode, invite.inviteExpiresAt);
+  const rotatedWorkspace = await rotateWorkspaceInvite(workspace.id, invite.inviteCode, invite.inviteExpiresAt);
   if (!rotatedWorkspace) {
     res.status(500).json({ error: "Unable to rotate workspace invite" });
     return;
   }
 
-  appendAuditLog(res.locals.authUsername, "Workspace Invite Rotated", {
+  await appendAuditLog(res.locals.authUsername, "Workspace Invite Rotated", {
     actorId: res.locals.authUsername,
     subjectId: res.locals.authUsername,
     workspaceId: workspace.id,
@@ -1465,8 +1735,8 @@ app.post("/workspaces/:id/invite/rotate", requireAuth, (req, res) => {
   res.json({ message: "Workspace invite rotated", workspace: rotatedWorkspace });
 });
 
-app.post("/workspaces/:id/members/:username/approve", requireAuth, (req, res) => {
-  const adminMembership = requireWorkspaceAdmin(req.params.id, res.locals.authUsername);
+app.post("/workspaces/:id/members/:username/approve", requireAuth, async (req, res) => {
+  const adminMembership = await requireWorkspaceAdmin(req.params.id, res.locals.authUsername);
   if (!adminMembership) {
     res.status(403).json({ error: "Workspace admin approval required" });
     return;
@@ -1477,7 +1747,7 @@ app.post("/workspaces/:id/members/:username/approve", requireAuth, (req, res) =>
     return;
   }
 
-  const target = getUser(req.params.username);
+  const target = await getUser(req.params.username);
   if (!target) {
     res.status(404).json({ error: "Identity not found" });
     return;
@@ -1487,13 +1757,13 @@ app.post("/workspaces/:id/members/:username/approve", requireAuth, (req, res) =>
     return;
   }
 
-  const membership = approveWorkspaceMember(req.params.id, req.params.username, res.locals.authUsername);
+  const membership = await approveWorkspaceMember(req.params.id, req.params.username, res.locals.authUsername);
   if (!membership) {
     res.status(409).json({ error: "Member is not pending approval" });
     return;
   }
 
-  appendAuditLog(req.params.username, "Workspace Member Approved", {
+  await appendAuditLog(req.params.username, "Workspace Member Approved", {
     actorId: res.locals.authUsername,
     subjectId: req.params.username,
     workspaceId: req.params.id,
@@ -1502,8 +1772,8 @@ app.post("/workspaces/:id/members/:username/approve", requireAuth, (req, res) =>
   res.json({ message: "Workspace member approved", member: serializeWorkspaceMember(membership) });
 });
 
-app.post("/workspaces/:id/members/:username/revoke", requireAuth, (req, res) => {
-  const adminMembership = requireWorkspaceAdmin(req.params.id, res.locals.authUsername);
+app.post("/workspaces/:id/members/:username/revoke", requireAuth, async (req, res) => {
+  const adminMembership = await requireWorkspaceAdmin(req.params.id, res.locals.authUsername);
   if (!adminMembership) {
     res.status(403).json({ error: "Workspace admin approval required" });
     return;
@@ -1519,7 +1789,7 @@ app.post("/workspaces/:id/members/:username/revoke", requireAuth, (req, res) => 
     return;
   }
 
-  const targetMembership = getWorkspaceMembership(req.params.id, req.params.username);
+  const targetMembership = await getWorkspaceMembership(req.params.id, req.params.username);
   if (!targetMembership) {
     res.status(404).json({ error: "Workspace member not found" });
     return;
@@ -1529,13 +1799,13 @@ app.post("/workspaces/:id/members/:username/revoke", requireAuth, (req, res) => 
     return;
   }
 
-  const revoked = revokeWorkspaceMember(req.params.id, req.params.username);
+  const revoked = await revokeWorkspaceMember(req.params.id, req.params.username);
   if (!revoked) {
     res.status(409).json({ error: "Workspace member is not active" });
     return;
   }
 
-  appendAuditLog(req.params.username, "Workspace Member Revoked", {
+  await appendAuditLog(req.params.username, "Workspace Member Revoked", {
     actorId: res.locals.authUsername,
     subjectId: req.params.username,
     workspaceId: req.params.id,
@@ -1544,8 +1814,8 @@ app.post("/workspaces/:id/members/:username/revoke", requireAuth, (req, res) => 
   res.json({ message: "Workspace member revoked" });
 });
 
-app.post("/workspaces/:id/members/:username/role", requireAuth, (req, res) => {
-  const ownerMembership = requireWorkspaceOwner(req.params.id, res.locals.authUsername);
+app.post("/workspaces/:id/members/:username/role", requireAuth, async (req, res) => {
+  const ownerMembership = await requireWorkspaceOwner(req.params.id, res.locals.authUsername);
   if (!ownerMembership) {
     res.status(403).json({ error: "Workspace owner role required" });
     return;
@@ -1567,7 +1837,7 @@ app.post("/workspaces/:id/members/:username/role", requireAuth, (req, res) => {
     return;
   }
 
-  const targetMembership = getWorkspaceMembership(req.params.id, req.params.username);
+  const targetMembership = await getWorkspaceMembership(req.params.id, req.params.username);
   if (!targetMembership) {
     res.status(404).json({ error: "Workspace member not found" });
     return;
@@ -1581,13 +1851,13 @@ app.post("/workspaces/:id/members/:username/role", requireAuth, (req, res) => {
     return;
   }
 
-  const membership = updateWorkspaceMemberRole(req.params.id, req.params.username, role);
+  const membership = await updateWorkspaceMemberRole(req.params.id, req.params.username, role);
   if (!membership) {
     res.status(409).json({ error: "Workspace member role could not be updated" });
     return;
   }
 
-  appendAuditLog(req.params.username, "Workspace Member Role Changed", {
+  await appendAuditLog(req.params.username, "Workspace Member Role Changed", {
     actorId: res.locals.authUsername,
     subjectId: req.params.username,
     workspaceId: req.params.id,
@@ -1596,27 +1866,31 @@ app.post("/workspaces/:id/members/:username/role", requireAuth, (req, res) => {
   res.json({ message: "Workspace member role updated", member: serializeWorkspaceMember(membership) });
 });
 
-app.post("/upload-prekeys", requireAuth, requireSelf, (req, res) => {
+app.post("/upload-prekeys", requireAuth, requireSelf, async (req, res) => {
   const { username, preKeys } = req.body;
   if (!username || !preKeys || !Array.isArray(preKeys)) {
     res.status(400).json({ error: "Missing username or preKeys array" });
     return;
   }
-  if (!getUser(username)) {
+  if (preKeys.length < 1 || preKeys.length > 250 || !preKeys.every(isValidPreKeyRecord)) {
+    res.status(400).json({ error: "Invalid pre-key bundle" });
+    return;
+  }
+  if (!await getUser(username)) {
     res.status(404).json({ error: "User not found" });
     return;
   }
 
-  addPreKeys(username, preKeys);
-  const remaining = getPreKeyStatus(username).available;
-  appendAuditLog(username, "One-Time Pre-Key Bundle Uploaded");
+  await addPreKeys(username, preKeys);
+  const remaining = (await getPreKeyStatus(username)).available;
+  await appendAuditLog(username, "One-Time Pre-Key Bundle Uploaded");
   console.log(`Stored ${preKeys.length} One-Time Pre-Keys for user ${username}. Available: ${remaining}`);
   res.json({ message: "Pre-Keys safely uploaded!", remaining });
 });
 
-app.get("/prekeys/:username/status", requireAuth, requireSelf, (req, res) => {
+app.get("/prekeys/:username/status", requireAuth, requireSelf, async (req, res) => {
   const { username } = req.params;
-  const userRecord = getUser(username);
+  const userRecord = await getUser(username);
 
   if (!userRecord) {
     res.status(404).json({ error: "User not found" });
@@ -1628,10 +1902,10 @@ app.get("/prekeys/:username/status", requireAuth, requireSelf, (req, res) => {
     return;
   }
 
-  res.json(getPreKeyStatus(username));
+  res.json(await getPreKeyStatus(username));
 });
 
-app.get("/share-readiness/:username", requireAuth, (req, res) => {
+app.get("/share-readiness/:username", requireAuth, async (req, res) => {
   const { username } = req.params;
   if (!isSafeUsername(username)) {
     res.status(400).json({ error: "Invalid username" });
@@ -1642,7 +1916,7 @@ app.get("/share-readiness/:username", requireAuth, (req, res) => {
     return;
   }
 
-  const userRecord = getUser(username);
+  const userRecord = await getUser(username);
   if (!userRecord) {
     res.status(404).json({ error: "User not found" });
     return;
@@ -1652,13 +1926,13 @@ app.get("/share-readiness/:username", requireAuth, (req, res) => {
     return;
   }
 
-  const workspaceApproved = usersShareActiveWorkspace(res.locals.authUsername, username);
+  const workspaceApproved = await usersShareActiveWorkspace(res.locals.authUsername, username);
   if (!workspaceApproved) {
     res.status(403).json({ error: "Recipient is not an active member of a shared workspace" });
     return;
   }
 
-  const preKeyStatus = getPreKeyStatus(username);
+  const preKeyStatus = await getPreKeyStatus(username);
   res.json({
     username,
     workspaceApproved: true,
@@ -1667,9 +1941,9 @@ app.get("/share-readiness/:username", requireAuth, (req, res) => {
   });
 });
 
-app.get("/prekey/:username", requireAuth, (req, res) => {
+app.get("/prekey/:username", requireAuth, async (req, res) => {
   const { username } = req.params;
-  const userRecord = getUser(username);
+  const userRecord = await getUser(username);
   
   if (!userRecord) {
     res.status(404).json({ error: "User not found" });
@@ -1681,18 +1955,18 @@ app.get("/prekey/:username", requireAuth, (req, res) => {
     return;
   }
 
-  if (username !== res.locals.authUsername && !usersShareActiveWorkspace(res.locals.authUsername, username)) {
+  if (username !== res.locals.authUsername && !await usersShareActiveWorkspace(res.locals.authUsername, username)) {
     res.status(403).json({ error: "Recipient is not an active member of a shared workspace" });
     return;
   }
   
-  const preKey = consumeNextPreKey(username);
+  const preKey = await consumeNextPreKey(username);
   if (!preKey) {
     res.status(404).json({ error: "No pre-keys available for this user" });
     return;
   }
 
-  const remaining = getPreKeyStatus(username).available;
+  const remaining = (await getPreKeyStatus(username)).available;
   console.log(`Issued One-Time Pre-Key for ${username}. Remaining: ${remaining}`);
   
   // Return only the public part
@@ -1703,8 +1977,9 @@ app.get("/prekey/:username", requireAuth, (req, res) => {
   });
 });
 
-app.get("/users", requireAuth, (req, res) => {
-  const users = listDiscoverableUsers(res.locals.authUsername).map((user) => ({
+app.get("/users", requireAuth, async (req, res) => {
+  const discoverableUsers = await listDiscoverableUsers(res.locals.authUsername);
+  const users = discoverableUsers.map((user) => ({
     username: user.username,
     identityPublicKeyECDH: user.identity_public_key_ecdh,
     identityPublicKeyECDSA: user.identity_public_key_ecdsa
@@ -1712,13 +1987,13 @@ app.get("/users", requireAuth, (req, res) => {
   res.json(users);
 });
 
-app.get("/security-summary", requireAuth, (_req, res) => {
-  const workspaces = listWorkspacesForUser(res.locals.authUsername);
-  const preKeys = getPreKeyStatus(res.locals.authUsername);
-  const sessions = listSessionRecords(res.locals.authUsername, res.locals.authSessionId);
-  const auditSummary = visibleAuditSummary(buildVisibleAuditView(res.locals.authUsername));
-  const files = listVaultFiles(res.locals.authUsername);
-  const storage = storageQuotaSnapshot(res.locals.authUsername);
+app.get("/security-summary", requireAuth, async (_req, res) => {
+  const workspaces = await listWorkspacesForUser(res.locals.authUsername);
+  const preKeys = await getPreKeyStatus(res.locals.authUsername);
+  const sessions = await listSessionRecords(res.locals.authUsername, res.locals.authSessionId);
+  const auditSummary = visibleAuditSummary(await buildVisibleAuditView(res.locals.authUsername));
+  const files = await listVaultFiles(res.locals.authUsername);
+  const storage = await storageQuotaSnapshot(res.locals.authUsername);
 
   res.json({
     workspaces: {
@@ -1745,8 +2020,8 @@ app.get("/security-summary", requireAuth, (_req, res) => {
   });
 });
 
-app.get("/storage-summary", requireAuth, (_req, res) => {
-  const storage = storageQuotaSnapshot(res.locals.authUsername);
+app.get("/storage-summary", requireAuth, async (_req, res) => {
+  const storage = await storageQuotaSnapshot(res.locals.authUsername);
   res.json({
     usedBytes: storage.usedBytes,
     quotaBytes: storage.quotaBytes,
@@ -1754,11 +2029,11 @@ app.get("/storage-summary", requireAuth, (_req, res) => {
   });
 });
 
-app.get("/vault-files", requireAuth, (req, res) => {
-  res.json({ files: listVaultFiles(res.locals.authUsername, { trashed: req.query.trash === "true" }) });
+app.get("/vault-files", requireAuth, async (req, res) => {
+  res.json({ files: await listVaultFiles(res.locals.authUsername, { trashed: req.query.trash === "true" }) });
 });
 
-app.post("/vault-files", requireAuth, uploadMiddleware.single("fileBlob"), (req, res) => {
+app.post("/vault-files", requireAuth, uploadMiddleware.single("fileBlob"), async (req, res) => {
   const { encryptedMetadata, metadataIv, wrappedFileKey, wrappedFileKeyIv } = req.body;
   if (!req.file || !encryptedMetadata || !metadataIv || !wrappedFileKey || !wrappedFileKeyIv) {
     removeUploadedFile(req.file?.filename);
@@ -1771,10 +2046,10 @@ app.post("/vault-files", requireAuth, uploadMiddleware.single("fileBlob"), (req,
     return;
   }
 
-  const quota = storageQuotaSnapshot(res.locals.authUsername, req.file.size);
+  const quota = await storageQuotaSnapshot(res.locals.authUsername, req.file.size);
   if (!quota.allowed) {
     removeUploadedFile(req.file.filename);
-    appendAuditLog(res.locals.authUsername, "Vault Upload Blocked Quota");
+    await appendAuditLog(res.locals.authUsername, "Vault Upload Blocked Quota");
     res.status(413).json({
       error: "Encrypted storage quota exceeded",
       usedBytes: quota.usedBytes,
@@ -1795,12 +2070,19 @@ app.post("/vault-files", requireAuth, uploadMiddleware.single("fileBlob"), (req,
     createdAt: Date.now()
   };
 
-  addVaultFile(res.locals.authUsername, vaultFile);
-  appendAuditLog(res.locals.authUsername, "Vault File Uploaded");
-  res.json({ message: "Encrypted vault file stored", file: vaultFile });
+  try {
+    await persistUploadedObject(req.file);
+    await addVaultFile(res.locals.authUsername, vaultFile);
+    await appendAuditLog(res.locals.authUsername, "Vault File Uploaded");
+    res.json({ message: "Encrypted vault file stored", file: vaultFile });
+  } catch {
+    removeUploadedFile(req.file.filename);
+    await blobStorage.delete(req.file.filename);
+    res.status(500).json({ error: "Unable to store encrypted vault blob" });
+  }
 });
 
-app.post("/vault-file-upload-sessions", requireAuth, (req, res) => {
+app.post("/vault-file-upload-sessions", requireAuth, async (req, res) => {
   cleanupExpiredVaultUploadSessions();
 
   const {
@@ -1835,9 +2117,9 @@ app.post("/vault-file-upload-sessions", requireAuth, (req, res) => {
     return;
   }
 
-  const quota = storageQuotaSnapshot(res.locals.authUsername, normalizedExpectedSize);
+  const quota = await storageQuotaSnapshot(res.locals.authUsername, normalizedExpectedSize);
   if (!quota.allowed) {
-    appendAuditLog(res.locals.authUsername, "Vault Upload Blocked Quota");
+    await appendAuditLog(res.locals.authUsername, "Vault Upload Blocked Quota");
     res.status(413).json({
       error: "Encrypted storage quota exceeded",
       usedBytes: quota.usedBytes,
@@ -1873,7 +2155,7 @@ app.post("/vault-file-upload-sessions", requireAuth, (req, res) => {
   });
 });
 
-app.get("/vault-file-upload-sessions/:id", requireAuth, (req, res) => {
+app.get("/vault-file-upload-sessions/:id", requireAuth, async (req, res) => {
   cleanupExpiredVaultUploadSessions();
   const session = vaultUploadSessions.get(req.params.id);
   if (!session || session.ownerUsername !== res.locals.authUsername) {
@@ -1890,7 +2172,7 @@ app.get("/vault-file-upload-sessions/:id", requireAuth, (req, res) => {
   });
 });
 
-app.post("/vault-file-upload-sessions/:id/chunks/:index", requireAuth, chunkUploadMiddleware.single("chunk"), (req, res) => {
+app.post("/vault-file-upload-sessions/:id/chunks/:index", requireAuth, chunkUploadMiddleware.single("chunk"), async (req, res) => {
   cleanupExpiredVaultUploadSessions();
   const session = vaultUploadSessions.get(req.params.id);
   const index = Number(req.params.index);
@@ -1953,10 +2235,10 @@ app.post("/vault-file-upload-sessions/:id/complete", requireAuth, async (req, re
       return;
     }
 
-    const quota = storageQuotaSnapshot(res.locals.authUsername, actualSize);
+    const quota = await storageQuotaSnapshot(res.locals.authUsername, actualSize);
     if (!quota.allowed) {
       fs.rmSync(finalPath, { force: true });
-      appendAuditLog(res.locals.authUsername, "Vault Upload Blocked Quota");
+      await appendAuditLog(res.locals.authUsername, "Vault Upload Blocked Quota");
       res.status(413).json({
         error: "Encrypted storage quota exceeded",
         usedBytes: quota.usedBytes,
@@ -1977,18 +2259,23 @@ app.post("/vault-file-upload-sessions/:id/complete", requireAuth, async (req, re
       createdAt: Date.now()
     };
 
-    addVaultFile(res.locals.authUsername, vaultFile);
+    await blobStorage.putFile(finalFilename, finalPath);
+    await addVaultFile(res.locals.authUsername, vaultFile);
+    if (blobStorage.driver === "s3") {
+      fs.rmSync(finalPath, { force: true });
+    }
     vaultUploadSessions.delete(session.id);
     removePathRecursive(session.dir);
-    appendAuditLog(res.locals.authUsername, "Vault File Uploaded In Chunks");
+    await appendAuditLog(res.locals.authUsername, "Vault File Uploaded In Chunks");
     res.json({ message: "Encrypted vault file stored", file: vaultFile });
   } catch {
     fs.rmSync(finalPath, { force: true });
+    await blobStorage.delete(finalFilename);
     res.status(500).json({ error: "Unable to assemble encrypted vault file" });
   }
 });
 
-app.delete("/vault-file-upload-sessions/:id", requireAuth, (req, res) => {
+app.delete("/vault-file-upload-sessions/:id", requireAuth, async (req, res) => {
   const session = vaultUploadSessions.get(req.params.id);
   if (!session || session.ownerUsername !== res.locals.authUsername) {
     res.status(404).json({ error: "Upload session not found" });
@@ -2000,8 +2287,8 @@ app.delete("/vault-file-upload-sessions/:id", requireAuth, (req, res) => {
   res.json({ message: "Encrypted upload session cancelled" });
 });
 
-app.patch("/vault-files/:id/metadata", requireAuth, (req, res) => {
-  const file = findVaultFile(res.locals.authUsername, req.params.id);
+app.patch("/vault-files/:id/metadata", requireAuth, async (req, res) => {
+  const file = await findVaultFile(res.locals.authUsername, req.params.id);
   if (!file) {
     res.status(404).json({ error: "Vault file not found" });
     return;
@@ -2022,7 +2309,7 @@ app.patch("/vault-files/:id/metadata", requireAuth, (req, res) => {
     return;
   }
 
-  const currentGrants = listVaultGrantsForFile(res.locals.authUsername, file.id);
+  const currentGrants = await listVaultGrantsForFile(res.locals.authUsername, file.id);
   const submittedSignatures = (grantSignatures || []) as Partial<VaultGrantSignatureUpdate>[];
   const signatureByGrantId = new Map<string, string>();
   for (const entry of submittedSignatures) {
@@ -2045,7 +2332,7 @@ app.patch("/vault-files/:id/metadata", requireAuth, (req, res) => {
     }
   }
 
-  const updatedFile = updateVaultFileMetadata(
+  const updatedFile = await updateVaultFileMetadata(
     res.locals.authUsername,
     file.id,
     encryptedMetadata,
@@ -2060,66 +2347,62 @@ app.patch("/vault-files/:id/metadata", requireAuth, (req, res) => {
     return;
   }
 
-  appendAuditLog(res.locals.authUsername, "Vault File Metadata Updated");
+  await appendAuditLog(res.locals.authUsername, "Vault File Metadata Updated");
   res.json({ message: "Vault file metadata updated", file: updatedFile });
 });
 
-app.get("/vault-files/:id/download", requireAuth, (req, res) => {
-  const file = findVaultFile(res.locals.authUsername, req.params.id);
+app.get("/vault-files/:id/download", requireAuth, async (req, res) => {
+  const file = await findVaultFile(res.locals.authUsername, req.params.id);
   if (!file) {
     res.status(404).json({ error: "Vault file not found" });
     return;
   }
 
-  const filepath = path.join(UPLOAD_DIR, file.filepath);
-  if (!fs.existsSync(filepath)) {
+  if (!await blobStorage.exists(file.filepath)) {
     res.status(404).json({ error: "Encrypted vault blob not found" });
     return;
   }
 
-  res.download(filepath);
+  await blobStorage.sendDownload(file.filepath, res);
 });
 
-app.delete("/vault-files/:id", requireAuth, (req, res) => {
-  const file = trashVaultFile(res.locals.authUsername, req.params.id);
+app.delete("/vault-files/:id", requireAuth, async (req, res) => {
+  const file = await trashVaultFile(res.locals.authUsername, req.params.id);
   if (!file) {
     res.status(404).json({ error: "Vault file not found" });
     return;
   }
 
-  appendAuditLog(res.locals.authUsername, "Vault File Moved To Trash");
+  await appendAuditLog(res.locals.authUsername, "Vault File Moved To Trash");
   res.json({ message: "Vault file moved to trash", file });
 });
 
-app.post("/vault-files/:id/restore", requireAuth, (req, res) => {
-  const file = restoreVaultFile(res.locals.authUsername, req.params.id);
+app.post("/vault-files/:id/restore", requireAuth, async (req, res) => {
+  const file = await restoreVaultFile(res.locals.authUsername, req.params.id);
   if (!file) {
     res.status(404).json({ error: "Trashed vault file not found" });
     return;
   }
 
-  appendAuditLog(res.locals.authUsername, "Vault File Restored");
+  await appendAuditLog(res.locals.authUsername, "Vault File Restored");
   res.json({ message: "Vault file restored", file });
 });
 
-app.delete("/vault-files/:id/permanent", requireAuth, (req, res) => {
-  const file = permanentlyDeleteVaultFile(res.locals.authUsername, req.params.id);
+app.delete("/vault-files/:id/permanent", requireAuth, async (req, res) => {
+  const file = await permanentlyDeleteVaultFile(res.locals.authUsername, req.params.id);
   if (!file) {
     res.status(404).json({ error: "Vault file not found" });
     return;
   }
 
-  const filepath = path.join(UPLOAD_DIR, file.filepath);
-  if (fs.existsSync(filepath)) {
-    fs.unlinkSync(filepath);
-  }
+  await blobStorage.delete(file.filepath);
 
-  appendAuditLog(res.locals.authUsername, "Vault File Permanently Deleted");
+  await appendAuditLog(res.locals.authUsername, "Vault File Permanently Deleted");
   res.json({ message: "Vault file permanently deleted" });
 });
 
-app.post("/vault-files/:id/share", requireAuth, (req, res) => {
-  const file = findVaultFile(res.locals.authUsername, req.params.id);
+app.post("/vault-files/:id/share", requireAuth, async (req, res) => {
+  const file = await findVaultFile(res.locals.authUsername, req.params.id);
   if (!file) {
     res.status(404).json({ error: "Vault file not found" });
     return;
@@ -2127,23 +2410,23 @@ app.post("/vault-files/:id/share", requireAuth, (req, res) => {
 
   const { recipientUsername, wrappedFileKey, ephemeralPublicKey, usedPreKey, signature } = req.body;
   if (!recipientUsername || !wrappedFileKey || !ephemeralPublicKey || !usedPreKey || !signature) {
-    appendAuditLog(res.locals.authUsername, "Vault Share Blocked");
+    await appendAuditLog(res.locals.authUsername, "Vault Share Blocked");
     res.status(400).json({ error: "Missing encrypted grant components" });
     return;
   }
   if (!isSafeUsername(recipientUsername) || ![wrappedFileKey, ephemeralPublicKey, usedPreKey, signature].every(isLikelyEncryptedComponent)) {
-    appendAuditLog(res.locals.authUsername, "Vault Share Blocked");
+    await appendAuditLog(res.locals.authUsername, "Vault Share Blocked");
     res.status(400).json({ error: "Invalid encrypted grant components" });
     return;
   }
 
   if (recipientUsername === res.locals.authUsername) {
-    appendAuditLog(res.locals.authUsername, "Vault Share Blocked");
+    await appendAuditLog(res.locals.authUsername, "Vault Share Blocked");
     res.status(400).json({ error: "Use your owner vault access for your own files" });
     return;
   }
 
-  const grantResult = buildVaultGrant(res.locals.authUsername, file.id, {
+  const grantResult = await buildVaultGrant(res.locals.authUsername, file.id, {
     recipientUsername,
     wrappedFileKey,
     ephemeralPublicKey,
@@ -2151,24 +2434,24 @@ app.post("/vault-files/:id/share", requireAuth, (req, res) => {
     signature
   });
   if ("error" in grantResult) {
-    appendAuditLog(res.locals.authUsername, "Vault Share Blocked");
+    await appendAuditLog(res.locals.authUsername, "Vault Share Blocked");
     res.status(grantResult.status || 400).json({ error: grantResult.error });
     return;
   }
 
   try {
-    addVaultGrant(grantResult.grant);
+    await addVaultGrant(grantResult.grant);
   } catch {
     res.status(409).json({ error: "File is already shared with this recipient" });
     return;
   }
 
-  appendAuditLog(res.locals.authUsername, "Vault File Shared");
+  await appendAuditLog(res.locals.authUsername, "Vault File Shared");
   res.json({ message: "Vault file shared", grant: grantResult.grant });
 });
 
-app.post("/vault-files/:id/rotate", requireAuth, uploadMiddleware.single("fileBlob"), (req, res) => {
-  const file = findVaultFile(res.locals.authUsername, req.params.id);
+app.post("/vault-files/:id/rotate", requireAuth, uploadMiddleware.single("fileBlob"), async (req, res) => {
+  const file = await findVaultFile(res.locals.authUsername, req.params.id);
   if (!file) {
     removeUploadedFile(req.file?.filename);
     res.status(404).json({ error: "Vault file not found" });
@@ -2207,7 +2490,7 @@ app.post("/vault-files/:id/rotate", requireAuth, uploadMiddleware.single("fileBl
       return;
     }
 
-    const grantResult = buildVaultGrant(res.locals.authUsername, file.id, grantInput);
+    const grantResult = await buildVaultGrant(res.locals.authUsername, file.id, grantInput);
     if ("error" in grantResult) {
       removeUploadedFile(req.file.filename);
       res.status(grantResult.status || 400).json({ error: grantResult.error });
@@ -2218,10 +2501,10 @@ app.post("/vault-files/:id/rotate", requireAuth, uploadMiddleware.single("fileBl
     replacementGrants.push(grantResult.grant);
   }
 
-  const quota = storageQuotaSnapshot(res.locals.authUsername, req.file.size, file.fileSize);
+  const quota = await storageQuotaSnapshot(res.locals.authUsername, req.file.size, file.fileSize);
   if (!quota.allowed) {
     removeUploadedFile(req.file.filename);
-    appendAuditLog(res.locals.authUsername, "Vault Upload Blocked Quota");
+    await appendAuditLog(res.locals.authUsername, "Vault Upload Blocked Quota");
     res.status(413).json({
       error: "Encrypted storage quota exceeded",
       usedBytes: quota.usedBytes,
@@ -2242,7 +2525,8 @@ app.post("/vault-files/:id/rotate", requireAuth, uploadMiddleware.single("fileBl
   };
 
   try {
-    const previousFile = rotateVaultFile(res.locals.authUsername, rotatedFile, replacementGrants);
+    await persistUploadedObject(req.file);
+    const previousFile = await rotateVaultFile(res.locals.authUsername, rotatedFile, replacementGrants);
     if (!previousFile) {
       removeUploadedFile(req.file.filename);
       res.status(404).json({ error: "Vault file not found" });
@@ -2250,57 +2534,57 @@ app.post("/vault-files/:id/rotate", requireAuth, uploadMiddleware.single("fileBl
     }
 
     if (previousFile.filepath !== req.file.filename) {
-      removeUploadedFile(previousFile.filepath);
+      await blobStorage.delete(previousFile.filepath);
     }
   } catch {
     removeUploadedFile(req.file.filename);
+    await blobStorage.delete(req.file.filename);
     res.status(500).json({ error: "Unable to rotate vault file" });
     return;
   }
 
-  appendAuditLog(res.locals.authUsername, "Vault File Rotated");
+  await appendAuditLog(res.locals.authUsername, "Vault File Rotated");
   res.json({ message: "Vault file rotated", file: rotatedFile, grants: replacementGrants });
 });
 
-app.get("/vault-files/:id/grants", requireAuth, (req, res) => {
-  const file = findVaultFile(res.locals.authUsername, req.params.id);
+app.get("/vault-files/:id/grants", requireAuth, async (req, res) => {
+  const file = await findVaultFile(res.locals.authUsername, req.params.id);
   if (!file) {
     res.status(404).json({ error: "Vault file not found" });
     return;
   }
 
-  res.json({ grants: listVaultGrantsForFile(res.locals.authUsername, req.params.id) });
+  res.json({ grants: await listVaultGrantsForFile(res.locals.authUsername, req.params.id) });
 });
 
-app.get("/shared-vault-files", requireAuth, (req, res) => {
-  res.json({ files: listSharedVaultFiles(res.locals.authUsername) });
+app.get("/shared-vault-files", requireAuth, async (req, res) => {
+  res.json({ files: await listSharedVaultFiles(res.locals.authUsername) });
 });
 
-app.get("/shared-vault-files/:grantId/download", requireAuth, (req, res) => {
-  const grant = findSharedVaultFile(res.locals.authUsername, req.params.grantId);
+app.get("/shared-vault-files/:grantId/download", requireAuth, async (req, res) => {
+  const grant = await findSharedVaultFile(res.locals.authUsername, req.params.grantId);
   if (!grant) {
     res.status(404).json({ error: "Shared vault file not found" });
     return;
   }
 
-  const file = findVaultFileById(grant.vaultFileId);
+  const file = await findVaultFileById(grant.vaultFileId);
   if (!file) {
     res.status(404).json({ error: "Shared vault file missing" });
     return;
   }
 
-  const filepath = path.join(UPLOAD_DIR, file.filepath);
-  if (!fs.existsSync(filepath)) {
+  if (!await blobStorage.exists(file.filepath)) {
     res.status(404).json({ error: "Encrypted vault blob not found" });
     return;
   }
 
-  res.download(filepath);
+  await blobStorage.sendDownload(file.filepath, res);
 });
 
-app.get("/identity/:username", requireAuth, requireSelf, (req, res) => {
+app.get("/identity/:username", requireAuth, requireSelf, async (req, res) => {
   const { username } = req.params;
-  const userRecord = getUser(username);
+  const userRecord = await getUser(username);
   if (!userRecord) {
     res.status(404).json({ error: "User not found" });
     return;
@@ -2317,60 +2601,52 @@ app.get("/identity/:username", requireAuth, requireSelf, (req, res) => {
   });
 });
 
-app.post("/upload", requireAuth, uploadMiddleware.single("fileBlob"), (req, res) => {
+app.post("/upload", requireAuth, uploadMiddleware.single("fileBlob"), async (req, res) => {
   const { recipientUsername, senderUsername, signature, fileIv, wrappedFileKey, ephemeralPublicKey, usedPreKey, originalFilename } = req.body;
   if (!recipientUsername || !senderUsername || !signature || !req.file || !fileIv || !wrappedFileKey || !ephemeralPublicKey || !usedPreKey) {
     removeUploadedFile(req.file?.filename);
-    appendAuditLog(res.locals.authUsername || "anonymous", "Dispatch Blocked");
+    await appendAuditLog(res.locals.authUsername || "anonymous", "Dispatch Blocked");
     res.status(400).json({ error: "Missing file package components" });
     return;
   }
   if (!isSafeUsername(recipientUsername) || !isSafeUsername(senderUsername) || ![signature, fileIv, wrappedFileKey, ephemeralPublicKey, usedPreKey].every(isLikelyEncryptedComponent)) {
     removeUploadedFile(req.file.filename);
-    appendAuditLog(res.locals.authUsername, "Dispatch Blocked");
+    await appendAuditLog(res.locals.authUsername, "Dispatch Blocked");
     res.status(400).json({ error: "Invalid file package components" });
     return;
   }
   if (senderUsername !== res.locals.authUsername) {
     removeUploadedFile(req.file.filename);
-    appendAuditLog(res.locals.authUsername, "Dispatch Blocked");
+    await appendAuditLog(res.locals.authUsername, "Dispatch Blocked");
     res.status(403).json({ error: "Sender does not match authenticated identity" });
     return;
   }
-  const recipient = getUser(recipientUsername);
+  const recipient = await getUser(recipientUsername);
   if (!recipient) {
     removeUploadedFile(req.file.filename);
-    appendAuditLog(senderUsername, "Dispatch Blocked");
+    await appendAuditLog(senderUsername, "Dispatch Blocked");
     res.status(404).json({ error: "Recipient not found" });
     return;
   }
   if (recipient.revokedAt) {
     removeUploadedFile(req.file.filename);
-    appendAuditLog(senderUsername, "Dispatch Blocked");
+    await appendAuditLog(senderUsername, "Dispatch Blocked");
     res.status(410).json({ error: "Recipient identity has been revoked" });
     return;
   }
-  if (!usersShareActiveWorkspace(senderUsername, recipientUsername)) {
+  if (!await usersShareActiveWorkspace(senderUsername, recipientUsername)) {
     removeUploadedFile(req.file.filename);
-    appendAuditLog(senderUsername, "Dispatch Blocked");
+    await appendAuditLog(senderUsername, "Dispatch Blocked");
     res.status(403).json({ error: "Recipient is not an active member of a shared workspace" });
     return;
   }
   
-  console.log(`\n--- NEW FILE UPLOAD ---`);
-  console.log(`Target Recipient: ${recipientUsername}`);
-  console.log(`Encrypted Data Path: ${req.file.path} (Simulated Disk Storage)`);
-  console.log(`Wrapped File Key (Hex): ${wrappedFileKey}`);
-  console.log(`Ephemeral Sender PubKey: ${ephemeralPublicKey.slice(0, 30)}...`);
-  console.log(`Used Recipient Pre-Key: ${usedPreKey.slice(0, 30)}...`);
-  console.log(`-----------------------\n`);
-
   // Locate the specific private key data for Bob to decrypt later
-  const matchingPreKey = getPreKey(recipientUsername, usedPreKey);
+  const matchingPreKey = await getPreKey(recipientUsername, usedPreKey);
   
   const inboxFile: InboxRecord = {
     filepath: req.file.filename,
-    originalFilename: originalFilename || "EncryptedFile.bin",
+    originalFilename: isNonEmptyBoundedString(originalFilename, 180) ? originalFilename.trim() : "EncryptedFile.bin",
     fileSize: req.file.size,
     fileIv,
     wrappedFileKey,
@@ -2382,19 +2658,24 @@ app.post("/upload", requireAuth, uploadMiddleware.single("fileBlob"), (req, res)
     preKeyIv: matchingPreKey ? matchingPreKey.iv : null,
     timestamp: Date.now()
   };
-  addInboxFile(recipientUsername, inboxFile);
-
-  appendAuditLog(recipientUsername, "File Package Encrypted & Uploaded");
-
-  res.json({ message: "File accurately packaged and securely uploaded!" });
+  try {
+    await persistUploadedObject(req.file);
+    await addInboxFile(recipientUsername, inboxFile);
+    await appendAuditLog(recipientUsername, "File Package Encrypted & Uploaded");
+    res.json({ message: "File accurately packaged and securely uploaded!" });
+  } catch {
+    removeUploadedFile(req.file.filename);
+    await blobStorage.delete(req.file.filename);
+    res.status(500).json({ error: "Unable to store encrypted file package" });
+  }
 });
 
-app.get("/audit-log", requireAuth, (req, res) => {
-  res.json(buildVisibleAuditView(res.locals.authUsername));
+app.get("/audit-log", requireAuth, async (req, res) => {
+  res.json(await buildVisibleAuditView(res.locals.authUsername));
 });
 
-app.get("/audit-anchor", requireAuth, (req, res) => {
-  const visibleEntries = buildVisibleAuditView(res.locals.authUsername);
+app.get("/audit-anchor", requireAuth, async (req, res) => {
+  const visibleEntries = await buildVisibleAuditView(res.locals.authUsername);
   const summary = visibleAuditSummary(visibleEntries);
   const exportedAt = Date.now();
   const digestPayload = JSON.stringify([
@@ -2417,31 +2698,30 @@ app.get("/audit-anchor", requireAuth, (req, res) => {
   });
 });
 
-app.get("/inbox/:username", requireAuth, requireSelf, (req, res) => {
+app.get("/inbox/:username", requireAuth, requireSelf, async (req, res) => {
   const { username } = req.params;
-  const userRecord = getUser(username);
+  const userRecord = await getUser(username);
   if (!userRecord) {
     res.status(404).json({ error: "User not found" });
     return;
   }
-  res.json({ inbox: listInbox(username), salt: userRecord.salt });
+  res.json({ inbox: await listInbox(username), salt: userRecord.salt });
 });
 
-app.get("/download-file/:filename", requireAuth, (req, res) => {
+app.get("/download-file/:filename", requireAuth, async (req, res) => {
   const authUsername = res.locals.authUsername as string;
-  const inboxEntry = findInboxFile(authUsername, req.params.filename);
+  const inboxEntry = await findInboxFile(authUsername, req.params.filename);
 
   if (!inboxEntry) {
     res.status(403).json({ error: "Not authorized to download this file" });
     return;
   }
 
-  const filepath = path.join(UPLOAD_DIR, req.params.filename);
-  if (!fs.existsSync(filepath)) {
+  if (!await blobStorage.exists(req.params.filename)) {
     res.status(404).json({ error: "File not found" });
     return;
   }
-  res.download(filepath);
+  await blobStorage.sendDownload(req.params.filename, res, inboxEntry.originalFilename);
 });
 
 app.use((err: unknown, req: express.Request, res: express.Response, next: express.NextFunction) => {
@@ -2474,15 +2754,36 @@ app.use((err: unknown, req: express.Request, res: express.Response, next: expres
   res.status(500).json({ error: "Internal server error", requestId });
 });
 
+let activeP2PWebSocketServer: WebSocketServer | null = null;
+let shuttingDown = false;
 const originalListen = app.listen.bind(app);
 app.listen = ((...args: Parameters<typeof app.listen>) => {
   const server = originalListen(...args);
-  attachP2PSignaling(server);
+  activeP2PWebSocketServer = attachP2PSignaling(server);
   return server;
 }) as typeof app.listen;
 
 if (require.main === module) {
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, () => {
     console.log(`Backend running on http://localhost:${PORT}`);
   });
+
+  async function shutdown(signal: NodeJS.Signals) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`Received ${signal}; shutting down CrypShare backend.`);
+    clearInterval(vaultUploadCleanupInterval);
+    activeP2PWebSocketServer?.clients.forEach((client) => client.close(1001, "Server shutting down"));
+    await new Promise<void>((resolve) => {
+      activeP2PWebSocketServer?.close(() => resolve()) ?? resolve();
+    });
+    await new Promise<void>((resolve) => {
+      server.close(() => resolve());
+    });
+    await closeDatabase();
+    process.exit(0);
+  }
+
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
 }

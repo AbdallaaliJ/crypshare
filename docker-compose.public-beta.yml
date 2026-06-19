@@ -1,0 +1,121 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      CRYPSHARE_PUBLIC_DEPLOYMENT: "true"
+      TRUST_PROXY: ${TRUST_PROXY:-true}
+      PORT: 3001
+      DATABASE_DRIVER: postgres
+      DATABASE_URL: postgres://${POSTGRES_USER:-crypshare}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-crypshare}
+      UPLOAD_DIR: /app/uploads
+      STORAGE_DRIVER: ${STORAGE_DRIVER:-s3}
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
+      S3_BUCKET: ${S3_BUCKET:-crypshare-vault}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?Set S3_ACCESS_KEY to a non-default MinIO/S3 access key}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?Set S3_SECRET_KEY to a non-default MinIO/S3 secret key}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_USE_SSL: ${S3_USE_SSL:-false}
+      CORS_ORIGINS: ${CORS_ORIGINS:?Set CORS_ORIGINS to your frontend origin}
+      SESSION_TTL_MS: ${SESSION_TTL_MS:-28800000}
+      SESSION_COOKIE_ENABLED: ${SESSION_COOKIE_ENABLED:-true}
+      SESSION_RETURN_BEARER_TOKEN: ${SESSION_RETURN_BEARER_TOKEN:-false}
+      SESSION_COOKIE_SECRET: ${SESSION_COOKIE_SECRET:?Set SESSION_COOKIE_SECRET to a long random secret}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-true}
+      SESSION_COOKIE_SAMESITE: ${SESSION_COOKIE_SAMESITE:-strict}
+      JSON_BODY_LIMIT: ${JSON_BODY_LIMIT:-256kb}
+      UPLOAD_FILE_LIMIT_BYTES: ${UPLOAD_FILE_LIMIT_BYTES:-16106127360}
+      UPLOAD_FIELD_LIMIT_BYTES: ${UPLOAD_FIELD_LIMIT_BYTES:-262144}
+      VAULT_CHUNK_UPLOAD_LIMIT_BYTES: ${VAULT_CHUNK_UPLOAD_LIMIT_BYTES:-8388608}
+      VAULT_UPLOAD_SESSION_TTL_MS: ${VAULT_UPLOAD_SESSION_TTL_MS:-14400000}
+      USER_STORAGE_QUOTA_BYTES: ${USER_STORAGE_QUOTA_BYTES:-107374182400}
+      RATE_LIMIT_WINDOW_MS: ${RATE_LIMIT_WINDOW_MS:-60000}
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-600}
+      AUTH_RATE_LIMIT_WINDOW_MS: ${AUTH_RATE_LIMIT_WINDOW_MS:-300000}
+      AUTH_RATE_LIMIT_MAX: ${AUTH_RATE_LIMIT_MAX:-30}
+      WORKSPACE_INVITE_TTL_MS: ${WORKSPACE_INVITE_TTL_MS:-604800000}
+      P2P_SESSION_TTL_MS: ${P2P_SESSION_TTL_MS:-900000}
+      P2P_SIGNAL_MAX_BYTES: ${P2P_SIGNAL_MAX_BYTES:-262144}
+      P2P_MAX_SOCKETS_PER_USER: ${P2P_MAX_SOCKETS_PER_USER:-5}
+      P2P_MAX_ACTIVE_SESSIONS_PER_USER: ${P2P_MAX_ACTIVE_SESSIONS_PER_USER:-20}
+      P2P_MAX_SIGNALING_TICKETS_PER_USER: ${P2P_MAX_SIGNALING_TICKETS_PER_USER:-5}
+      P2P_STUN_URLS: ${P2P_STUN_URLS:-}
+      P2P_TURN_URLS: ${P2P_TURN_URLS:?Set P2P_TURN_URLS to a reachable TURN relay URL}
+      P2P_TURN_SHARED_SECRET: ${P2P_TURN_SHARED_SECRET:?Set P2P_TURN_SHARED_SECRET to the coturn static-auth-secret}
+      P2P_TURN_CREDENTIAL_TTL_MS: ${P2P_TURN_CREDENTIAL_TTL_MS:-600000}
+    ports:
+      - "${BACKEND_PORT:-3001}:3001"
+    volumes:
+      - crypshare_backend_data:/app/data
+      - crypshare_backend_uploads:/app/uploads
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
+        VITE_SESSION_COOKIE_ENABLED: ${VITE_SESSION_COOKIE_ENABLED:-true}
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-crypshare}
+      POSTGRES_USER: ${POSTGRES_USER:-crypshare}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - crypshare_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-crypshare} -d ${POSTGRES_DB:-crypshare}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - crypshare_minio:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  crypshare_backend_data:
+  crypshare_backend_uploads:
+  crypshare_postgres:
+  crypshare_minio:

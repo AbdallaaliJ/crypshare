@@ -11,9 +11,9 @@ services:
       - --relay-ip=172.30.238.2
       - --external-ip=${TURN_EXTERNAL_IP:-127.0.0.1}/172.30.238.2
       - --fingerprint
-      - --lt-cred-mech
+      - --use-auth-secret
+      - --static-auth-secret=${TURN_SHARED_SECRET:-dev-only-turn-shared-secret-change-me}
       - --realm=${TURN_REALM:-crypshare.local}
-      - --user=${TURN_USERNAME:-crypshare}:${TURN_PASSWORD:-change-this-turn-password}
       - --allow-loopback-peers
       - --no-cli
       - --no-tls

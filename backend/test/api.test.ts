@@ -10,7 +10,7 @@ import WebSocket from "ws";
 let baseUrl = "";
 let server: http.Server;
 let tempDir = "";
-let closeDatabase: (() => void) | undefined;
+let closeDatabase: (() => void | Promise<void>) | undefined;
 
 function sha256Hex(value: string) {
   return crypto.createHash("sha256").update(value).digest("hex");
@@ -171,7 +171,7 @@ after(async () => {
   await new Promise<void>((resolve, reject) => {
     server.close((err) => (err ? reject(err) : resolve()));
   });
-  closeDatabase?.();
+  await closeDatabase?.();
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
 
@@ -182,12 +182,31 @@ test("API enforces auth, authorization, pre-key state, and audit integrity", asy
   const rootBody = await root.json();
   assert.equal(rootBody.name, "CrypShare API");
 
+  const blockedCors = await request("/", {
+    headers: { Origin: "https://evil.example" }
+  });
+  assert.equal(blockedCors.headers.get("access-control-allow-origin"), null);
+
+  const localhostCors = await request("/", {
+    headers: { Origin: "http://localhost:5174" }
+  });
+  assert.equal(localhostCors.headers.get("access-control-allow-origin"), "http://localhost:5174");
+
   const health = await request("/health");
   assert.equal(health.status, 200);
   assert.equal(health.headers.get("x-content-type-options"), "nosniff");
   assert.equal(health.headers.get("x-frame-options"), "DENY");
   assert.ok(health.headers.get("x-request-id"));
   assert.equal(health.headers.get("cache-control"), "no-store");
+  const healthBody = await health.json();
+  assert.equal(healthBody.status, "ok");
+  assert.equal(healthBody.storage.ready, true);
+  assert.equal(healthBody.database.ready, true);
+
+  const ready = await requestJson("/ready");
+  assert.equal(ready.res.status, 200);
+  assert.equal(ready.body.status, "ok");
+  assert.equal(ready.body.database.ready, true);
 
   const uploadLimits = await requestJson("/upload-limits");
   assert.equal(uploadLimits.res.status, 200);
@@ -611,6 +630,16 @@ test("API enforces auth, authorization, pre-key state, and audit integrity", asy
     })
   });
   assert.equal(crossPreKeyUpload.res.status, 403);
+
+  const invalidPreKeyUpload = await requestJson("/upload-prekeys", {
+    method: "POST",
+    headers: authHeaders(bobToken),
+    body: JSON.stringify({
+      username: "bob",
+      preKeys: [{ publicKeyHex: "missing-private-key", iv: "iv" }]
+    })
+  });
+  assert.equal(invalidPreKeyUpload.res.status, 400);
 
   const preKeyUpload = await requestJson("/upload-prekeys", {
     method: "POST",

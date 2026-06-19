@@ -8,7 +8,11 @@ export function apiUrl(path: string): string {
 }
 
 export function wsUrl(path: string): string {
-  const base = API_BASE_URL.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:');
+  const absoluteBase =
+    API_BASE_URL.startsWith('http://') || API_BASE_URL.startsWith('https://')
+      ? API_BASE_URL
+      : `${typeof window === 'undefined' ? 'http://localhost' : window.location.origin}${API_BASE_URL.startsWith('/') ? API_BASE_URL : `/${API_BASE_URL}`}`;
+  const base = absoluteBase.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:');
   return `${base}${path.startsWith('/') ? path : `/${path}`}`;
 }
 

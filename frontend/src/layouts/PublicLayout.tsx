@@ -14,6 +14,12 @@ export const PublicLayout: React.FC = () => {
           <CrypShareLogo markSize={38} wordmarkClassName="text-xl" className="hidden sm:inline-flex" />
         </Link>
         
+        <div className="hidden lg:flex items-center gap-5 text-xs font-bold uppercase tracking-wider text-[var(--app-muted)]">
+          <Link to="/features" className="hover:text-[var(--app-text)] transition-colors" style={{ textDecoration: 'none' }}>Features</Link>
+          <Link to="/security" className="hover:text-[var(--app-text)] transition-colors" style={{ textDecoration: 'none' }}>Security</Link>
+          <Link to="/privacy" className="hover:text-[var(--app-text)] transition-colors" style={{ textDecoration: 'none' }}>Privacy</Link>
+        </div>
+
         <div className="flex flex-row gap-2 sm:gap-3 items-center">
           <ThemeToggle compact />
           <Link 
@@ -38,6 +44,15 @@ export const PublicLayout: React.FC = () => {
       <main className="flex-1 flex items-center justify-center p-6 relative z-10">
         <Outlet />
       </main>
+
+      <footer className="relative z-10 border-t border-[var(--app-border)] px-4 md:px-12 py-5 text-xs text-[var(--app-muted)] flex flex-col sm:flex-row gap-3 sm:items-center sm:justify-between">
+        <span>CrypShare public beta. Not certified for regulated high-security use.</span>
+        <div className="flex gap-4">
+          <Link to="/terms" className="hover:text-[var(--app-text)]" style={{ textDecoration: 'none' }}>Terms</Link>
+          <Link to="/privacy" className="hover:text-[var(--app-text)]" style={{ textDecoration: 'none' }}>Privacy</Link>
+          <Link to="/contact" className="hover:text-[var(--app-text)]" style={{ textDecoration: 'none' }}>Contact</Link>
+        </div>
+      </footer>
     </div>
   );
 };

@@ -84,6 +84,15 @@ cd backend
 npm test
 ```
 
+Run a live API smoke test against the currently running backend:
+
+```bash
+cd backend
+SMOKE_API_BASE_URL=http://127.0.0.1:3001 npm run smoke:api
+```
+
+The smoke test creates uniquely named throwaway identities and a workspace, then verifies login, workspace approval, pre-key upload, encrypted vault upload, sharing, shared download, and smoke file cleanup against the real API/database.
+
 Start the frontend:
 
 ```bash
@@ -97,6 +106,83 @@ The frontend defaults to `http://localhost:3001` for the API. Override it with:
 VITE_API_BASE_URL=http://localhost:3001 npm run dev
 ```
 
+## Database And Object Storage
+
+Local development uses SQLite for metadata by default. The public-beta Docker stack runs PostgreSQL as the live metadata database and MinIO/S3-compatible encrypted blob storage:
+
+Before publishing or deploying, review [docs/PUBLIC_BETA_RELEASE_CHECKLIST.md](docs/PUBLIC_BETA_RELEASE_CHECKLIST.md).
+
+```bash
+cp .env.example .env
+# Replace all deployment secrets and public origins in .env before starting.
+docker compose -f docker-compose.public-beta.yml up -d
+```
+
+For an internet-facing public beta, start from the stricter production template instead of local defaults:
+
+```bash
+cp .env.public-beta.example .env.production
+# Replace every placeholder with real secrets, domains, and TURN/S3 credentials.
+cd backend
+DEPLOYMENT_ENV_FILE=.env.production npm run check:deploy
+```
+
+You can also check a live deployment after it starts:
+
+```bash
+cd backend
+DEPLOYMENT_ENV_FILE=.env.production DEPLOYMENT_CHECK_READY_URL=https://your-domain.example/api/ready npm run check:deploy
+SMOKE_API_BASE_URL=https://your-domain.example/api npm run smoke:api
+```
+
+The public-beta compose stack starts:
+
+- `frontend` on `http://localhost:8080`
+- `backend` on `http://localhost:3001`
+- `minio` API on `http://localhost:9000`
+- `minio` console on `http://localhost:9001`
+- `postgres` on `localhost:5432` as the live metadata database for the compose deployment
+
+MinIO exposes its API at `http://localhost:9000` and the console at `http://localhost:9001` with the credentials from your local `.env`.
+
+`docker-compose.public-beta.yml` intentionally fails fast if required public-beta secrets are missing. Do not use old placeholder values such as `crypshare`, `change-this-minio-password`, or `dev-only-turn-shared-secret-change-me` for internet-facing deployments.
+
+If the backend is behind the bundled frontend proxy, a load balancer, or another reverse proxy, set `TRUST_PROXY=true`. This lets request logging and rate limiting use the real client IP from forwarded headers instead of treating every user as the proxy container.
+
+To store encrypted vault blobs in MinIO/S3 instead of local disk, set:
+
+```bash
+STORAGE_DRIVER=s3
+S3_ENDPOINT=http://127.0.0.1:9000
+S3_BUCKET=crypshare-vault
+S3_ACCESS_KEY=<your-minio-access-key>
+S3_SECRET_KEY=<your-long-minio-secret-key>
+S3_USE_SSL=false
+```
+
+Only encrypted file blobs are written to object storage. Plaintext file names, folders, and file keys remain encrypted client-side before upload.
+
+PostgreSQL is the live runtime metadata store when `DATABASE_DRIVER=postgres` and `DATABASE_URL` are set. The backend initializes `backend/src/postgres/schema.sql` at startup, while local development can keep `DATABASE_DRIVER=sqlite` for simple single-machine testing.
+
+Backend probes:
+
+- `GET /health` returns backend readiness, encrypted blob storage status, and database adapter status.
+- `GET /ready` is available for deployment readiness checks and returns `503` until both the database and encrypted blob storage are reachable.
+- Probe responses do not expose database URLs, S3 credentials, or file metadata.
+
+To copy existing local SQLite metadata into PostgreSQL before switching a real deployment:
+
+```bash
+cd backend
+DATABASE_URL=postgres://crypshare:<your-postgres-password>@127.0.0.1:5432/crypshare npm run migrate:postgres
+```
+
+The migration refuses to write into a non-empty target by default. For a deliberate test reset, add `POSTGRES_MIGRATION_TRUNCATE=true`.
+
+For an actual internet-facing deployment, replace all placeholder secrets, configure a real TURN host, set strict HTTPS `CORS_ORIGINS`, enable secure HttpOnly cookie sessions, and keep `CRYPSHARE_PUBLIC_DEPLOYMENT=true`/`NODE_ENV=production` so the backend rejects unsafe defaults at startup.
+
+See `docs/DEPLOYMENT_RUNBOOK.md` for the public-beta deployment checklist, backup expectations, monitoring notes, and incident-response steps. See `SECURITY.md` for the project security policy and known public-beta limitations.
+
 ## Large File Uploads
 
 CrypShare public beta defaults to a 15 GiB encrypted vault size limit through `UPLOAD_FILE_LIMIT_BYTES`.
@@ -106,9 +192,9 @@ Vault uploads now use short-lived resumable upload sessions. The browser encrypt
 
 Storage is owner-paid: encrypted vault bytes count against `USER_STORAGE_QUOTA_BYTES`, including files in Trash because their encrypted blobs still occupy disk. Permanent deletion frees quota. Quota failures are audited without logging plaintext filenames.
 
-This is a real improvement over one giant multipart upload, but it is still not a 5TB production architecture by itself. For 5TB-class files without weakening privacy, the app should continue toward:
+This is a real improvement over one giant multipart upload, and MinIO/S3 support moves encrypted blobs off the API server disk. It is still not a 5TB production architecture by itself. For 5TB-class files without weakening privacy, the app should continue toward:
 
-- Durable object storage or a chunk-addressed blob store instead of local disk assembly.
+- Direct-to-object-storage multipart uploads or a chunk-addressed blob store instead of local server-side assembly.
 - Resume-after-browser-restart using encrypted manifests.
 - Per-user/workspace quotas and abuse controls.
 - Background cleanup for expired partial upload sessions.
@@ -128,6 +214,7 @@ The CrypShare server handles authenticated WebSocket signaling through short-liv
 - P2P uses TURN relay-only WebRTC DataChannels for a stronger privacy boundary than direct peer discovery.
 - Direct STUN-assisted P2P is disabled in the app UI because it can expose peer network metadata directly between users.
 - TURN can observe network metadata such as IPs, timing, and packet sizes, but CrypShare encrypts the transfer manifest and every file chunk before sending them over the WebRTC channel.
+- The backend issues short-lived TURN credentials from a server-side shared secret instead of exposing a permanent relay password to browsers.
 - Senders can choose a known approved workspace member or paste a CrypShare identity invite URL for an unknown user.
 - Unknown-user P2P identity lookup requires the invite fingerprint, which reduces public username probing.
 - Recipients must explicitly accept incoming transfers. Untrusted identities are shown with a fingerprint warning and can be accepted once or trusted for future transfers.
@@ -146,21 +233,29 @@ docker compose -f docker-compose.turn.yml up
 For local testing, configure the backend with:
 
 ```bash
-P2P_TURN_URLS=turn:127.0.0.1:3478?transport=udp,turn:127.0.0.1:3478?transport=tcp
-P2P_TURN_USERNAME=crypshare
-P2P_TURN_CREDENTIAL=change-this-turn-password
+P2P_TURN_URLS=turn:127.0.0.1:3478?transport=tcp,turn:127.0.0.1:3478?transport=udp
+P2P_TURN_SHARED_SECRET=dev-only-turn-shared-secret-change-me
+P2P_TURN_CREDENTIAL_TTL_MS=600000
+TURN_SHARED_SECRET=dev-only-turn-shared-secret-change-me
 TURN_EXTERNAL_IP=127.0.0.1
 ```
 
-Then restart the backend and send the P2P invite again. The app enforces TURN relay-only mode automatically.
+Then restart the backend and check local TURN TCP reachability:
 
-For public deployment, run TURN on a reachable public host and replace `127.0.0.1` with the TURN domain or IP. Open UDP/TCP `3478` and the relay UDP port range configured in `docker-compose.turn.yml`. TURN can see IPs, timing, and packet sizes, but CrypShare encrypts the file manifest and every chunk before WebRTC sends them.
+```bash
+cd backend
+npm run check:turn
+```
+
+After that, open P2P Transfer and run the in-app TURN self-test. The app enforces TURN relay-only mode automatically.
+
+For public deployment, run TURN on a reachable public host and replace `127.0.0.1` with the TURN domain or IP. Open UDP/TCP `3478` and the relay UDP port range configured in `docker-compose.turn.yml`. Use a long random `P2P_TURN_SHARED_SECRET`/`TURN_SHARED_SECRET`, keep it only on the backend and TURN host, and rotate it if relay access is suspected to be leaked. TURN can see IPs, timing, and packet sizes, but CrypShare encrypts the file manifest and every chunk before WebRTC sends them.
 
 ## Current Limitations
 
 - Public beta means suitable for small trusted groups and senior-project evaluation, not certified high-security or defense deployment.
-- Backend metadata is persisted to SQLite with schema migrations.
-- Uploaded encrypted blobs are stored on local disk under the backend upload folder. Public deployments should move encrypted blob storage to durable object storage before serious use.
+- Backend metadata uses SQLite for local development and PostgreSQL for the public-beta compose deployment. SQLite-to-PostgreSQL migration is available, but production cutovers should be rehearsed on backups first.
+- Uploaded encrypted blobs default to local disk under the backend upload folder. Public-beta deployments can switch encrypted blob storage to MinIO/S3 with `STORAGE_DRIVER=s3`.
 - P2P Transfer is online-only and depends on TURN relay reachability. Strict networks may still block TURN/WebRTC.
 - P2P presence is session-scoped: users are online for transfer invites while logged into the dashboard, and offline after logout or connection loss.
 - Vault uploads use browser-side encrypted chunks with short-lived upload sessions, then the server assembles the encrypted blob. This avoids one giant multipart request, but true 5TB-scale use still needs object storage, quotas, resumable downloads, and operational cleanup jobs.
@@ -174,7 +269,7 @@ For public deployment, run TURN on a reachable public host and replace `127.0.0.
 - Workspace invite codes expire and can be rotated by workspace owners/admins, but they are still access hints, not identity proof.
 - Workspace owners can promote or demote workspace admins. Admins can approve members and rotate invites, but only owners can change roles.
 - The first registered identity still receives a legacy server `admin` role during migration, but public-ready collaboration should use workspace owner/admin roles instead of one global gatekeeper.
-- The backend issues bearer sessions after password-derived authentication. Sessions are stored as hashes in SQLite and can be listed/revoked, but distributed deployments should move session/rate-limit state to a shared store.
+- The backend issues bearer sessions after password-derived authentication. Sessions are stored as hashes in the configured metadata database and can be listed/revoked, but distributed deployments should move rate-limit state to a shared store.
 - Internet-facing deployments can enable `SESSION_COOKIE_ENABLED=true` to set HttpOnly session cookies and signed CSRF tokens. For stricter browser auth, set `SESSION_RETURN_BEARER_TOKEN=false` and `VITE_SESSION_COOKIE_ENABLED=true` so the frontend authenticates with the HttpOnly cookie plus CSRF header instead of a readable bearer token. Leave `VITE_SESSION_COOKIE_ENABLED=false` for normal local bearer-token development.
 - Backend rate limits and upload limits are in-memory process controls. They need Redis or an equivalent shared store before horizontal scaling.
 - Activity shown to users is scoped to their own account plus workspace events they are allowed to administer; random public users should not see each other's activity.
@@ -183,9 +278,9 @@ For public deployment, run TURN on a reachable public host and replace `127.0.0.
 
 ## Hardening Roadmap
 
-1. Persist backend metadata and audit logs across restarts. Done, now backed by SQLite.
+1. Persist backend metadata and audit logs across restarts. Done with SQLite for local development and PostgreSQL for the public-beta compose deployment.
 2. Add server-side authentication, sessions, and authorization checks. Done with password-derived auth secrets and bearer sessions.
-3. Move persistence to a real database with migrations and backups. Done with SQLite, `schema_migrations`, and `npm run backup`.
+3. Move persistence to a real database with migrations and backups. Started with SQLite `schema_migrations`, `npm run backup`, PostgreSQL runtime support, and a SQLite-to-PostgreSQL migration script; production backup/restore should use `pg_dump` or managed database snapshots.
 4. Add API tests, crypto flow tests, and tamper/regression tests. Started with backend auth, authorization, pre-key, and audit-chain regression coverage.
 5. Add key lifecycle controls: revocation, device management, recovery policy, and rotation design. Started with persistent active-session controls, hashed bearer sessions, and emergency identity revocation.
 6. Add verified contact enrollment: invite import, fingerprint verification, and local trusted-contact management. Done for prototype use; formal deployments still need organization-issued identity certificates.
@@ -213,10 +308,10 @@ For public deployment, run TURN on a reachable public host and replace `127.0.0.
 14. Pre-key health automation. Started with low-inventory detection, browser-side automatic refill, shared refill helpers, and clearer Security status copy.
 15. Trash and restore. Started with soft-delete vault files, restore, permanent purge, active/shared filtering, and Files Trash UI.
 16. Encrypted metadata editing. Started with owner-side rename and folder moves that re-encrypt metadata locally and refresh shared grant signatures.
-17. Large file readiness. Started with a 15 GiB configurable encrypted upload limit, `/upload-limits`, encrypted-size preflight checks, short-lived encrypted chunk upload sessions, owner-paid storage quotas, chunk retry/status checks, and documented object-storage work for 5TB-class deployments.
+17. Large file readiness. Started with a 15 GiB configurable encrypted upload limit, `/upload-limits`, encrypted-size preflight checks, short-lived encrypted chunk upload sessions, owner-paid storage quotas, chunk retry/status checks, MinIO/S3 encrypted blob storage support, and documented direct multipart work for 5TB-class deployments.
 18. Peer-to-peer transfer. Started with short-lived signaling tickets, TURN relay-only WebRTC DataChannel transfer, encrypted manifests/chunks, explicit recipient acceptance, unknown-user invite fingerprint checks, and browser TURN self-test diagnostics.
 19. Privacy and UX consolidation. Started with simplified workspace labels, invite-link continuity through login, hidden advanced invite details, Security privacy-boundary copy, and P2P diagnostics moved behind an advanced trace.
-20. Deployment hardening. Started with optional secure cookie sessions, CSRF guardrails, explicit cookie configuration, production validation for cookie secrets, and `SESSION_RETURN_BEARER_TOKEN=false` support for cookie-only browser sessions.
+20. Deployment hardening. Started with optional secure cookie sessions, CSRF guardrails, explicit cookie configuration, production validation for cookie secrets, `SESSION_RETURN_BEARER_TOKEN=false` support for cookie-only browser sessions, live PostgreSQL metadata, and MinIO/S3 encrypted blob infrastructure.
 
 ## Legacy Compatibility
 

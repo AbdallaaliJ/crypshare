@@ -13,6 +13,7 @@ import { DashboardLayout } from "./layouts/DashboardLayout";
 
 // Pages
 import { LandingPage } from "./pages/LandingPage";
+import { PublicInfoPage } from "./pages/PublicInfoPage";
 import { LoginPage } from "./pages/LoginPage";
 import { RegisterPage } from "./pages/RegisterPage";
 import { AuditVault } from "./pages/AuditVault";
@@ -24,7 +25,6 @@ import { SecurityPage } from "./pages/SecurityPage";
 import { OverviewPage } from "./pages/OverviewPage";
 import { P2PTransferPage } from "./pages/P2PTransferPage";
 import { WorkspaceSharePage } from "./pages/WorkspaceSharePage";
-import { SettingsPage } from "./pages/SettingsPage";
 import { rememberPendingInviteUrl } from "./utils/trust";
 
 // Protected Route Wrapper
@@ -46,6 +46,11 @@ function AppRoutes() {
       <Routes>
         <Route element={<PublicLayout />}>
           <Route path="/" element={<LandingPage />} />
+          <Route path="/features" element={<PublicInfoPage />} />
+          <Route path="/security" element={<PublicInfoPage />} />
+          <Route path="/privacy" element={<PublicInfoPage />} />
+          <Route path="/terms" element={<PublicInfoPage />} />
+          <Route path="/contact" element={<PublicInfoPage />} />
           <Route path="/login" element={<LoginPage />} />
           <Route path="/register" element={<RegisterPage />} />
         </Route>
@@ -65,7 +70,7 @@ function AppRoutes() {
           <Route path="audit" element={<Navigate to="/dashboard/activity" replace />} />
           <Route path="workspace-admin" element={<WorkspaceAdminPage />} />
           <Route path="security" element={<SecurityPage />} />
-          <Route path="settings" element={<SettingsPage />} />
+          <Route path="settings" element={<Navigate to="/dashboard/security" replace />} />
         </Route>
 
         {/* Fallback */}

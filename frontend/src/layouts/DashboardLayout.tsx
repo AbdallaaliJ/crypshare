@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { Outlet, NavLink, useNavigate } from 'react-router-dom';
-import { History, LogOut, User, Folder, Users, Contact, UploadCloud, Building2, ShieldCheck, Search, LayoutDashboard, AlertTriangle, RadioTower, FolderKanban, Settings } from 'lucide-react';
+import { History, LogOut, User, Folder, Users, Contact, UploadCloud, Building2, ShieldCheck, Search, LayoutDashboard, AlertTriangle, RadioTower, FolderKanban } from 'lucide-react';
 import { useAuth } from '../hooks/useAuth';
 import { useToast } from '../components/ui/useToast';
 import { IconButton } from '../components/ui/IconButton';
@@ -140,8 +140,15 @@ export const DashboardLayout: React.FC = () => {
     { to: '/dashboard/contacts', icon: Contact, label: 'Contacts' },
     { to: '/dashboard/activity', icon: History, label: 'Activity' },
     { to: '/dashboard/workspace-admin', icon: Building2, label: 'Workspace Admin' },
-    { to: '/dashboard/security', icon: ShieldCheck, label: 'Security' },
-    { to: '/dashboard/settings', icon: Settings, label: 'Settings' }
+    { to: '/dashboard/security', icon: ShieldCheck, label: 'Security' }
+  ];
+
+  const mobileNavItems = [
+    { to: '/dashboard/overview', icon: LayoutDashboard, label: 'Overview' },
+    { to: '/dashboard/files', icon: Folder, label: 'Files' },
+    { to: '/dashboard/shared', icon: Users, label: 'Shared' },
+    { to: '/dashboard/p2p', icon: RadioTower, label: 'P2P' },
+    { to: '/dashboard/security', icon: ShieldCheck, label: 'Security' }
   ];
 
   const sidebar = (
@@ -297,10 +304,31 @@ export const DashboardLayout: React.FC = () => {
           <ThemeToggle compact />
         </header>
 
-        <main className="app-main min-h-[calc(100vh-4rem)] p-4 sm:p-6 lg:p-8">
+        <main className="app-main min-h-[calc(100vh-4rem)] p-4 pb-24 sm:p-6 sm:pb-24 lg:p-8">
           <Outlet context={{ workspaces, activeWorkspaceId, selectedWorkspace } satisfies DashboardOutletContext} />
         </main>
       </div>
+
+      <nav className="fixed inset-x-3 bottom-3 z-50 grid grid-cols-5 rounded-lg border border-[var(--app-border)] bg-[var(--app-header-bg)] p-1 shadow-[var(--app-shadow)] backdrop-blur-xl md:hidden">
+        {mobileNavItems.map((item) => {
+          const Icon = item.icon;
+          return (
+            <NavLink
+              key={item.to}
+              to={item.to}
+              className={({ isActive }) => `flex min-h-12 flex-col items-center justify-center gap-1 rounded-md px-1 text-[10px] font-semibold transition-colors ${
+                isActive
+                  ? 'bg-[var(--brand-blue)] text-white'
+                  : 'text-[var(--app-muted)] hover:bg-[var(--app-surface-muted)] hover:text-[var(--app-text)]'
+              }`}
+              aria-label={item.label}
+            >
+              <Icon className="h-4 w-4" />
+              <span className="truncate">{item.label}</span>
+            </NavLink>
+          );
+        })}
+      </nav>
     </div>
   );
 };
